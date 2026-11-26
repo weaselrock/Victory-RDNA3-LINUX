@@ -1299,6 +1299,42 @@ fn placeholder(block: usize) -> bool {
     status >= 0 && region.region_type & PLACEHOLDER_RESERVATION != 0
 }
 
+/// Whether the placeholders the runtime tells of are taken for such without
+/// asking the host (`VICTORY_WINE_HOLES=0`: the host alone is asked; any
+/// other value: on every host). Wine does not answer what [`placeholder`]
+/// asks, so no hole was known there, and every asking about view memory put
+/// a `VirtualQuery` to Wine for each of its holes, which takes a lock that
+/// Wine's memory calls share: 3,600 to 9,800 questions a frame, and 31% of
+/// the refresh threads' processor time.
+fn wine_holes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::wine::on_under_wine("VICTORY_WINE_HOLES"))
+}
+
+/// The runtime made a placeholder of `[at, at + len)` for the title: under
+/// Wine, its holes are known from now on as ones only a mapping fills
+/// ([`wine_holes`]). What takes memory out of it is told
+/// ([`title_memory_freed`], [`title_memory_allocated`]).
+pub fn title_memory_placeholder(at: usize, len: usize) {
+    if !wine_holes() {
+        return;
+    }
+    // (Whole blocks only.)
+    let (first, last) = (at.div_ceil(BLOCK), at.saturating_add(len) / BLOCK);
+    if first >= last {
+        return;
+    }
+    let mut g = guards();
+    g.forget_placeholders(first, last);
+    g.reserved.push((first, last));
+    drop(g);
+    tracing::info!(
+        address = format_args!("{at:#x}"),
+        len,
+        "a placeholder of the title's: Wine is not asked about its holes (VICTORY_WINE_HOLES=0 asks)"
+    );
+}
+
 /// The runtime gave the title memory at `[at, at + len)`, allocated or
 /// committed: what was known of holes there is asked again.
 pub fn title_memory_allocated(at: usize, len: usize) {
@@ -1306,6 +1342,7 @@ pub fn title_memory_allocated(at: usize, len: usize) {
         return;
     }
     let mut g = guards();
+    g.forget_placeholders(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     let blocks: Vec<usize> = g.held.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).collect();
     for block in blocks {
         g.held.remove(block);
@@ -1555,6 +1592,9 @@ struct Guards {
     absent: Blocks,
     /// Of those, the ones in placeholders ([`known_holes`]).
     held: Blocks,
+    /// Under Wine, the placeholders the runtime said it made for the title,
+    /// first block to past the last ([`title_memory_placeholder`]).
+    reserved: Vec<(usize, usize)>,
     /// Blocks that were absent and turned out to be other memory than views
     /// when something was there again: never guarded, copied every time.
     foreign: BTreeSet<usize>,
@@ -1595,6 +1635,29 @@ impl Guards {
         put_count(block).store(0, std::sync::atomic::Ordering::Relaxed);
         self.opened.insert(block, std::time::Instant::now());
     }
+
+    /// Whether `block` lies in a placeholder the runtime told of.
+    fn told_placeholder(&self, block: usize) -> bool {
+        self.reserved.iter().any(|&(first, last)| (first..last).contains(&block))
+    }
+
+    /// Past the last block of the told placeholder `block` lies in, else
+    /// `block`.
+    fn placeholder_end(&self, block: usize) -> usize {
+        self.reserved.iter().find(|r| (r.0..r.1).contains(&block)).map_or(block, |r| r.1)
+    }
+
+    /// Takes `[first, last)` out of the told placeholders.
+    fn forget_placeholders(&mut self, first: usize, last: usize) {
+        if first >= last {
+            return;
+        }
+        self.reserved = std::mem::take(&mut self.reserved)
+            .into_iter()
+            .flat_map(|(from, to)| [(from, to.min(first)), (from.max(last), to)])
+            .filter(|(from, to)| from < to)
+            .collect();
+    }
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
@@ -1602,6 +1665,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     clean: Blocks::new(),
     absent: Blocks::new(),
     held: Blocks::new(),
+    reserved: Vec::new(),
     foreign: BTreeSet::new(),
     kernel: Vec::new(),
     changing: Vec::new(),
@@ -2123,7 +2187,7 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
         }
         if block < uncommitted_until {
             g.absent.insert(block);
-            if known_holes() && placeholder(block) {
+            if known_holes() && (g.told_placeholder(block) || placeholder(block)) {
                 g.held.insert(block);
             }
         }
@@ -2660,6 +2724,10 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 pub fn title_memory_freed(at: usize, len: usize) {
     let mut g = guards();
     let first = at / BLOCK;
+    // What is released is no placeholder's any more (with no length: from
+    // here to that placeholder's end, which is at least what goes).
+    let past = if len != 0 { at.saturating_add(len).div_ceil(BLOCK) } else { g.placeholder_end(first) };
+    g.forget_placeholders(first, past);
     let noted = [g.protected.range(first..).next(), g.absent.range(first..).next(), g.foreign.range(first..).next().copied()];
     let Some(noted) = noted.into_iter().flatten().min() else {
         return;
