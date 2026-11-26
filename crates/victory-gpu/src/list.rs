@@ -234,6 +234,23 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 #[cfg(windows)]
 const IDLE_MOST: (usize, u64) = (512, 256 << 20);
 
+/// How many of those idle lists are kept: `VICTORY_IDLE_LISTS` (up to 512),
+/// 512 if unset. An idle list keeps its command allocator, and an allocator
+/// keeps the memory of the largest recording it has had: fewer idle lists is
+/// less memory, and more lists made anew.
+#[cfg(windows)]
+fn idle_most_lists() -> usize {
+    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        let most = std::env::var("VICTORY_IDLE_LISTS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(IDLE_MOST.0, |n| n.min(IDLE_MOST.0));
+        tracing::info!(most, "idle host lists kept");
+        most
+    })
+}
+
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
 #[cfg(windows)]
@@ -273,7 +290,7 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= idle_most_lists() {
             continue;
         }
         // As the title's reset does: what the list kept for its commands
@@ -281,7 +298,7 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         host.reset();
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
+        if idle.0.len() < idle_most_lists() && idle.1 + bytes <= IDLE_MOST.1 {
             idle.0.push(Idle(host, bytes));
             idle.1 += bytes;
         }

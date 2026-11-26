@@ -234,6 +234,33 @@ pub(crate) struct HostHeap {
     spanned: Slots,
 }
 
+impl Drop for HostHeap {
+    /// Under Wine: the title released its heap, and what the slots viewed
+    /// and the stride table go through the graveyard (`crate::host::retire`),
+    /// not at once. Lists recorded or in flight that bound the heap hold the
+    /// host heap object (`HostList::keep`) but not what its descriptors view:
+    /// a shader reading a slot of it read freed memory (a texture-unit page
+    /// fault; the owner's tree, d46d31b). And its title-memory run leaves
+    /// the map ([`crate::memory::heap_gone`]).
+    fn drop(&mut self) {
+        if !crate::wine::on_wine() {
+            return;
+        }
+        crate::memory::heap_gone(std::ptr::from_ref(self) as usize);
+        let mut n = 0u64;
+        for slot in std::mem::take(&mut self.kept) {
+            if let Some(resource) = slot.into_inner().unwrap_or_else(|e| e.into_inner()) {
+                n += 1;
+                crate::host::retire_resource(resource);
+            }
+        }
+        if let Some((strides, ..)) = self.strides.take() {
+            crate::host::retire_resource(strides);
+        }
+        tracing::info!(slots = n, "a host view heap is let go: what its slots viewed is retired");
+    }
+}
+
 /// Whether a slot's write of no placed texture view leaves `placed` alone
 /// when the slot is not in it ([`HostHeap::spanned`]; `VICTORY_SPANS_QUICK=0`:
 /// its lock is taken for every write, as before).
@@ -365,6 +392,22 @@ static NEW_PENDING: std::sync::LazyLock<Mutex<std::collections::HashSet<(usize, 
 
 /// Slots held back by [`show_new_later`] since the start.
 pub(crate) static NEW_LATER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Slots of first uploads on the copy queue ([`HostHeap::texture_slot_show_ahead`])
+/// held past that upload until the drawing queue's submissions begun before
+/// their texture had finished, since the start (`VICTORY_PUBLISH_SAFE`).
+pub(crate) static AHEAD_HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The submission after which a slot shown once its texture's upload on
+/// the copy queue has run may change: under `safe` (Wine,
+/// [`crate::pool::publish_safe`]) the newest begun when its texture was made
+/// if one of those may still run (`begun`), else none (0: when the upload
+/// has run, as elsewhere). That upload's fence says nothing of the drawing
+/// queue, where lists sent before the texture existed may read the slot by
+/// index: the fork's own account of its device losses with the pool.
+fn ahead_after(safe: bool, begun: Option<u64>) -> u64 {
+    if safe { begun.unwrap_or(0) } else { 0 }
+}
 
 /// The submissions begun when the host texture `view` shows was made, if
 /// one begun before that may still run ([`crate::pool::begun_before`]). The
@@ -1284,6 +1327,12 @@ fn view_kind(view: &View) -> u32 {
     }
 }
 
+/// The table by slot's dword for a slot showing `view`: its stride with its
+/// format kind, 0 for none or not a buffer view.
+fn slot_word(view: &View) -> u32 {
+    view_stride(view).map_or(0, |stride| stride | view_kind(view))
+}
+
 /// A buffer view's structure stride, whether it is raw, and its format;
 /// `None` if `view` is not a buffer view.
 fn view_elements(view: &View) -> Option<(u32, bool, u32)> {
@@ -1886,7 +1935,35 @@ impl HostHeap {
         taken[first..first + n].fill(true);
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
         *next = ((first + n) % end) as u32;
-        Some(self.count + first as u32)
+        let first = self.count + first as u32;
+        // Slots made otherwise than as a table's entry (root views, the
+        // memory directory's run) must not show an earlier owner's word.
+        for index in first..first + n as u32 {
+            self.table_word(index, 0);
+        }
+        Some(first)
+    }
+
+    /// Enters `word` ([`slot_word`]) for dynamic slot `index` in the table by
+    /// slot, with `VICTORY_TABLE_SLOT_WORDS` (`victory_shader::emit::table_slot_words`):
+    /// a program reads the views of its tables, which the host copies into
+    /// dynamic slots, through it as it reads the title's slots. The face
+    /// network's tables (0aa7934094794dbf and the rest of the
+    /// `compute_graph_ops`) are all made so; without their words the 16-bit
+    /// integer path never ran for them, its output stayed zero, faces did
+    /// not move and eyes glowed. The title's slots have theirs from
+    /// [`HostHeap::note_buffer`] whatever the switch.
+    fn table_word(&self, index: u32, word: u32) {
+        if index < self.count || !victory_shader::emit::table_slot_words() {
+            return;
+        }
+        if let Some((_, _, data)) = &self.strides
+            && index < victory_shader::emit::SLOT_STRIDES_COUNT
+        {
+            // SAFETY: inside the mapping; shaders read it while we write (a
+            // dword, either value is one the slot had).
+            unsafe { (*data as *mut u32).add(index as usize).write_volatile(word) };
+        }
     }
 
     /// The title slots this heap has host slots for; fewer than the title's
@@ -2355,8 +2432,14 @@ impl HostHeap {
         }
         let (heap, key) = (std::ptr::from_ref(self) as usize, record_key(handle));
         let late = Some(crate::frame::current());
+        // The copy queue's run says nothing of the drawing queue's: lists
+        // sent there before the texture was made may still read this slot.
+        let safe = crate::pool::publish_safe() && show_new_later();
+        let begun = if safe { super::view(handle).as_ref().and_then(begun_before) } else { None };
+        let after = ahead_after(safe, begun);
+        AHEAD_HELD.fetch_add(u64::from(after != 0), std::sync::atomic::Ordering::Relaxed);
         job.then(move || {
-            let flip = Flip { after: 0, heap, index, handle, key, late };
+            let flip = Flip { after, heap, index, handle, key, late };
             FLIPS.lock().unwrap_or_else(|e| e.into_inner()).push(flip);
         });
     }
@@ -2760,6 +2843,7 @@ impl HostHeap {
         if kept.is_none() {
             null_for(view, self.at(index));
         }
+        self.table_word(index, if kept.is_some() { slot_word(view) } else { 0 });
         self.put(index);
         self.twin_made(index, kept.is_some() && twinned(view));
         self.keep(index, kept.flatten());
@@ -2800,9 +2884,11 @@ impl HostHeap {
                     ready: (0, 0, false),
                     tabled: None,
                 };
-                views.made.insert(words, ListView { view, at, twin, kept, listed });
+                let word = slot_word(&view);
+                views.made.insert(words, ListView { view, at, twin, kept, listed, word });
             }
             let made = &views.made[&words];
+            self.table_word(index, made.word);
             self.copy_from(index, views.slot(made.at));
             if made.twin && twins {
                 self.copy_from(self.raw + index, views.slot(made.at + 1));
@@ -2832,6 +2918,7 @@ impl HostHeap {
         if self.sampler {
             self.null_sampler(index);
         } else {
+            self.table_word(index, 0);
             null_view(self.at(index));
             self.put(index);
         }
@@ -2970,6 +3057,18 @@ impl HostHeap {
     /// nothing: reads give zeros, writes are dropped.
     pub(crate) fn null_raw_uav_at(&self, index: u32) {
         let Some(host) = host() else { return };
+        // Under Wine a view of real zeros ([`null_buffer_zeros`]): the
+        // title-memory run's slots, slot 0 (pages without a copy, address 0)
+        // among them, and root UAVs with nothing behind them.
+        if let Some(z) = zero_buffers() {
+            // SAFETY: a slot of our heap; a live buffer of ours (writes land
+            // there and are never read back).
+            unsafe { host.device.CreateUnorderedAccessView(&z[1], None::<&ID3D12Resource>, Some(&zero_uav_desc()), self.at(index)) };
+            self.put(index);
+            self.clear_twin(index);
+            self.keep(index, None);
+            return;
+        }
         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
@@ -3016,6 +3115,7 @@ impl HostHeap {
     pub(crate) fn constant_at(&self, index: u32, buffer: &ID3D12Resource, gpu: u64, size: u32) {
         static HOLDS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let holds = *HOLDS.get_or_init(|| std::env::var_os("VICTORY_SLOT_HOLDS").is_none_or(|v| v != "0"));
+        self.table_word(index, 0);
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
@@ -4768,12 +4868,33 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
             return null_like(desc[..10].try_into().unwrap_or(&[0; 10]), at);
         }
         View::Constant(..) => {
-            let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
-            // SAFETY: a slot of our heap; a zero location makes a null view.
+            // Under Wine 64 KiB of real zeros ([`null_buffer_zeros`]), not
+            // location 0.
+            let desc = match zero_buffer_gpu() {
+                Some(gpu) => D3D12_CONSTANT_BUFFER_VIEW_DESC { BufferLocation: gpu, SizeInBytes: 64 << 10 },
+                None => D3D12_CONSTANT_BUFFER_VIEW_DESC::default(),
+            };
+            // SAFETY: a slot of our heap; zeros of ours, or a zero location
+            // (a null view).
             return unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
         }
         _ => return null_view(at),
     };
+    if buffer && let Some(z) = zero_buffers() {
+        // Typed, as the null view it stands for (review: a raw view where
+        // the shader loads typed is another kind of descriptor).
+        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_UINT,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV { NumElements: (ZERO_BYTES / 4) as u32, ..Default::default() },
+            },
+        };
+        // SAFETY: a slot of our heap; a live buffer of ours (writes land
+        // there and are never read back).
+        unsafe { host.device.CreateUnorderedAccessView(&z[1], None::<&ID3D12Resource>, Some(&desc), at) };
+        return;
+    }
     let desc = if buffer {
         D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_UINT,
@@ -4838,6 +4959,23 @@ fn null_uav_desc(dimension: Option<u32>) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
 /// buffers).
 fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
+    if let Some(z) = zero_buffers() {
+        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    NumElements: (ZERO_BYTES / 4) as u32,
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                    ..Default::default()
+                },
+            },
+        };
+        // SAFETY: a slot of our heap; a live buffer of ours.
+        unsafe { host.device.CreateShaderResourceView(&z[0], Some(&desc), at) };
+        return;
+    }
     let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
         Format: DXGI_FORMAT_R32_TYPELESS,
         ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
@@ -4855,6 +4993,95 @@ fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         host.device
             .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
     };
+}
+
+/// Whether views of buffers that read nothing are views of real buffers of
+/// zeros (`VICTORY_NULL_BUFFER_ZEROS`, on under Wine; =0 off; never
+/// elsewhere): 64 MiB to read, and another 64 MiB for unordered views to
+/// write into, never read back.
+///
+/// Why: the owner's run play-va2 (2026-11-25) lost the device on scalar
+/// data reads (amdgpu "SQC (data)") at GPU addresses 0x0, 0x10000, 0x3f000
+/// ... 0xc4000: a buffer read through a view whose base address is 0, at
+/// the offsets the shader computed. A null buffer view gives no memory and,
+/// on vkd3d-proton's path for such views, no bound the load is held to; a
+/// view of real zeros reads zeros at any offset within its size. The
+/// title-memory run's slot 0, which pages without a copy (address 0, where
+/// ray-tracing passes run with ray tracing off are handed a structure that
+/// is not there) read through, is such a view (`crate::memory`,
+/// `VICTORY_MEMORY_RUN_FIRST` in the owner's tree).
+fn null_buffer_zeros() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| zeros_on(crate::wine::on_wine(), std::env::var_os("VICTORY_NULL_BUFFER_ZEROS").as_deref()))
+}
+
+/// [`null_buffer_zeros`]'s decision: under Wine unless the switch is `0`.
+fn zeros_on(wine: bool, switch: Option<&std::ffi::OsStr>) -> bool {
+    wine && switch.is_none_or(|v| v != "0")
+}
+
+/// The bytes of each buffer of [`null_buffer_zeros`].
+const ZERO_BYTES: u64 = 64 << 20;
+
+/// A raw unordered access view of the whole buffer to write into
+/// ([`zero_buffers`]).
+fn zero_uav_desc() -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+    D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: DXGI_FORMAT_R32_TYPELESS,
+        ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+            Buffer: D3D12_BUFFER_UAV {
+                NumElements: (ZERO_BYTES / 4) as u32,
+                Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                ..Default::default()
+            },
+        },
+    }
+}
+
+/// The buffers of [`null_buffer_zeros`]: to read (0) and to write (1);
+/// `None` when it is off or the host refused them.
+fn zero_buffers() -> Option<&'static [ID3D12Resource; 2]> {
+    if !null_buffer_zeros() {
+        return None;
+    }
+    static MADE: std::sync::OnceLock<Option<[ID3D12Resource; 2]>> = std::sync::OnceLock::new();
+    MADE.get_or_init(|| {
+        let host = host()?;
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+        let make = || -> Option<ID3D12Resource> {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: ZERO_BYTES,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_UNKNOWN,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            let mut r: Option<ID3D12Resource> = None;
+            // SAFETY: plain creation; committed resources start zeroed.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut r)
+                    .ok()?;
+            }
+            r
+        };
+        let made = [make()?, make()?];
+        tracing::info!(mb = ZERO_BYTES >> 20, "views of buffers that read nothing read real zeros (VICTORY_NULL_BUFFER_ZEROS)");
+        Some(made)
+    })
+    .as_ref()
+}
+
+/// The GPU address of the buffer of zeros to read ([`null_buffer_zeros`]).
+pub(crate) fn zero_buffer_gpu() -> Option<u64> {
+    // SAFETY: a live buffer.
+    zero_buffers().map(|b| unsafe { b[0].GetGPUVirtualAddress() })
 }
 
 /// A texture view that reads zeros with the dimension (and mip and array
@@ -4925,6 +5152,28 @@ mod tests {
         // SAFETY: live heap query.
         assert_eq!(unsafe { full.heap.GetDesc().NumDescriptors }, 2048);
         assert_eq!(full.count, 2047);
+    }
+
+    /// A first upload's slot waits for the drawing queue's lists begun
+    /// before its texture under Wine; elsewhere, or with none of those
+    /// left, it changes when the upload has run.
+    #[test]
+    fn first_uploads_wait_for_lists_sent_before_their_texture() {
+        assert_eq!(ahead_after(true, Some(7)), 7);
+        assert_eq!(ahead_after(true, None), 0);
+        assert_eq!(ahead_after(false, Some(7)), 0);
+    }
+
+    /// Null buffer views read real zeros only under Wine, unless switched
+    /// off.
+    #[test]
+    fn null_buffers_read_zeros_only_under_wine() {
+        use std::ffi::OsStr;
+        assert!(zeros_on(true, None));
+        assert!(zeros_on(true, Some(OsStr::new("1"))));
+        assert!(!zeros_on(true, Some(OsStr::new("0"))));
+        assert!(!zeros_on(false, None));
+        assert!(!zeros_on(false, Some(OsStr::new("1"))));
     }
 
     /// A view of a host copy that begins at a later level shows the same
@@ -5123,6 +5372,34 @@ mod tests {
         assert_eq!(view_kind(&uav(39, 0, 1)), 0, "raw");
         assert_eq!(view_kind(&uav(0, 16, 0)), 0, "structured");
         assert_eq!(view_stride(&uav(12, 0, 0)), Some(8));
+        assert_eq!(slot_word(&uav(57, 0, 0)), 2 | VIEW_INTEGER, "R16_UINT");
+        assert_eq!(slot_word(&View::Constant(0, 256)), 0, "constant buffer");
+    }
+
+    /// With `VICTORY_TABLE_SLOT_WORDS` (on under Wine) the slots tables are
+    /// copied into get their words in the table by slot, and a slot taken
+    /// again starts from none; the title's slots are left to `note_buffer`.
+    #[test]
+    fn dynamic_slots_get_their_words_in_the_table_by_slot() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let Some((_, _, data)) = &heap.strides else {
+            return;
+        };
+        if !victory_shader::emit::table_slot_words() {
+            return; // switched off
+        }
+        // SAFETY: inside the mapping.
+        let word = |index: u32| unsafe { (*data as *const u32).add(index as usize).read_volatile() };
+        let index = heap.dynamic(1).unwrap();
+        heap.table_word(index, 2 | victory_shader::emit::VIEW_INTEGER);
+        assert_eq!(word(index), 2 | victory_shader::emit::VIEW_INTEGER);
+        heap.table_word(1, 8);
+        assert_eq!(word(1), 0, "a title slot");
+        heap.release(index, 1);
+        assert_eq!(heap.dynamic(heap.dynamic), Some(4), "every dynamic slot");
+        assert_eq!(word(index), 0, "taken again");
     }
 
     /// What may stand for a texture that is not there yet: one of its kind in
@@ -5892,6 +6169,8 @@ struct ListView {
     twin: bool,
     kept: Kept,
     listed: Listed,
+    /// Its dword in the table by slot ([`slot_word`]).
+    word: u32,
 }
 
 /// The descriptors a thread made for one recording of a list, by the record

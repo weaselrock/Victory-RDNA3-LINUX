@@ -12,7 +12,7 @@ use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ops::Deref;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
@@ -80,6 +80,96 @@ const FALLBACK_BUTTONS: [(u8, u32); 14] = [
     (b'H', RIGHT_STICK),
 ];
 
+/// The stand-in gamepad of keyboard and mouse together (`VICTORY_MOUSE=1`),
+/// laid out the way third-person titles are on a PC; README lists it.
+/// Left stick: W/A/S/D. Right stick: the mouse ([`Look`]). Triggers: the
+/// right mouse button (left) and the left one (right); Z is the left trigger
+/// too. Caps Lock switches to driving and back: W and S are then the right
+/// and left trigger (the pedals) and Space the right shoulder; A and D still
+/// steer. A pad has one set of buttons for walking and driving and a title
+/// does not say which it is at, so the switch is the player's.
+const MOUSE_BUTTONS: [(u8, u32); 22] = [
+    (0x1B, MENU), // Esc
+    (b'P', MENU),
+    (b'V', VIEW),
+    (0x0D, A), // Enter
+    (0xA0, A), // left Shift
+    (0x08, B), // Backspace
+    (b'R', B),
+    (SPACE, X),
+    (b'X', X),
+    (b'F', Y),
+    (b'Y', Y),
+    (0x26, UP), // arrows
+    (0x28, DOWN),
+    (0x25, LEFT),
+    (0x27, RIGHT),
+    (b'E', RIGHT),
+    (0x09, LEFT_SHOULDER), // Tab
+    (b'Q', RIGHT_SHOULDER),
+    (0xA2, LEFT_STICK), // left Ctrl
+    (b'C', RIGHT_STICK),
+    (b'G', LEFT_STICK),
+    (b'H', RIGHT_STICK),
+];
+const SPACE: u8 = 0x20;
+
+/// What the mouse adds to the stand-in pad.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Pointer {
+    /// The mouse is part of the pad: the keys are [`MOUSE_BUTTONS`]'.
+    on: bool,
+    right_x: f32,
+    right_y: f32,
+    /// The left and the right button.
+    fire: bool,
+    aim: bool,
+    /// The keys are laid out for driving.
+    drive: bool,
+}
+
+/// Mouse travel as a stick: a stick sets how fast the camera turns, a mouse
+/// how far. Travel is kept and paid out as a deflection that turns the camera
+/// at `speed` pixels a second when full, so the whole of a movement arrives,
+/// a twentieth of a second late at most while the stick is not full.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Look {
+    x: f32,
+    y: f32,
+}
+
+impl Look {
+    /// The time over which travel is paid out, in seconds.
+    const LAG: f32 = 0.045;
+    /// The most travel kept, in seconds of a full stick: a flick does not
+    /// turn the camera for long after the hand has stopped.
+    const KEPT: f32 = 0.25;
+
+    /// Takes `(dx, dy)` pixels moved in the last `dt` seconds; gives the
+    /// stick (right and up positive). `dead` is the share of the stick the
+    /// title ignores around its middle: a deflection starts above it.
+    fn turn(&mut self, (dx, dy): (f32, f32), dt: f32, speed: f32, dead: f32) -> (f32, f32) {
+        let axis = |kept: &mut f32, moved: f32| {
+            *kept = (*kept + moved).clamp(-speed * Self::KEPT, speed * Self::KEPT);
+            let stick = (*kept / (speed * Self::LAG)).clamp(-1.0, 1.0);
+            *kept -= stick * speed * dt.min(Self::LAG);
+            if stick.abs() < 0.004 {
+                0.0
+            } else {
+                stick.signum() * (dead + (1.0 - dead) * stick.abs())
+            }
+        };
+        (axis(&mut self.x, dx), -axis(&mut self.y, dy))
+    }
+}
+
+/// Whether the mouse is held for the camera right now: the pointer is not
+/// shown over the title's picture then (`lifecycle`'s window procedure).
+pub(crate) fn mouse_held() -> bool {
+    MOUSE_HELD.load(Ordering::Relaxed)
+}
+static MOUSE_HELD: AtomicBool = AtomicBool::new(false);
+
 /// A gamepad reading: triggers 0 to 1, sticks -1 to 1 (up positive).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -111,29 +201,56 @@ trait Source: Send {
     fn pad(&mut self, slot: usize) -> Option<PadState>;
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
+    /// The mouse as part of the stand-in pad; nothing unless the host has one.
+    fn pointer(&mut self) -> Pointer {
+        Pointer::default()
+    }
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
 
-fn fallback(keys: &[KeyState]) -> PadState {
-    let on = |vk: u8| {
+fn fallback(keys: &[KeyState], pointer: Pointer) -> PadState {
+    let on = |vk: u8| -> f32 {
         if keys.iter().any(|k| k.virtual_key == vk) {
             1.0
         } else {
             0.0
         }
     };
+    if !pointer.on {
+        return PadState {
+            buttons: FALLBACK_BUTTONS
+                .iter()
+                .filter(|(vk, _)| on(*vk) != 0.0)
+                .fold(0, |all, (_, bit)| all | bit),
+            left_trigger: on(b'Z'),
+            right_trigger: on(b'C'),
+            left_x: on(b'D') - on(b'A'),
+            left_y: on(b'W') - on(b'S'),
+            right_x: on(b'L') - on(b'J'),
+            right_y: on(b'I') - on(b'K'),
+        };
+    }
+    let held = |held: bool| -> f32 { if held { 1.0 } else { 0.0 } };
+    // Driving: W and S are the pedals, Space the handbrake.
+    let drive = pointer.drive;
+    let (walk, gas, brake) = if drive {
+        (0.0, on(b'W'), on(b'S'))
+    } else {
+        (on(b'W') - on(b'S'), 0.0, 0.0)
+    };
+    let handbrake = if drive && on(SPACE) != 0.0 { RIGHT_SHOULDER } else { 0 };
     PadState {
-        buttons: FALLBACK_BUTTONS
+        buttons: MOUSE_BUTTONS
             .iter()
-            .filter(|(vk, _)| on(*vk) != 0.0)
-            .fold(0, |all, (_, bit)| all | bit),
-        left_trigger: on(b'Z'),
-        right_trigger: on(b'C'),
+            .filter(|(vk, _)| on(*vk) != 0.0 && !(drive && *vk == SPACE))
+            .fold(handbrake, |all, (_, bit)| all | bit),
+        left_trigger: on(b'Z').max(held(pointer.aim)).max(brake),
+        right_trigger: held(pointer.fire).max(gas),
         left_x: on(b'D') - on(b'A'),
-        left_y: on(b'W') - on(b'S'),
-        right_x: on(b'L') - on(b'J'),
-        right_y: on(b'I') - on(b'K'),
+        left_y: walk,
+        right_x: pointer.right_x,
+        right_y: pointer.right_y,
     }
 }
 
@@ -430,12 +547,12 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
+        let (pads, keys, pointer) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys())
+            (pads, source.keys(), source.pointer())
         };
-        let events = self.state().poll(&self.devices, self.one_pad, pads, keys);
+        let events = self.state().poll(&self.devices, self.one_pad, pads, keys, pointer);
         self.deliver(events);
     }
 
@@ -481,11 +598,12 @@ impl State {
         one_pad: bool,
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        pointer: Pointer,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
         if one_pad {
-            let pad = pads.into_iter().flatten().fold(fallback(&keys), merged);
+            let pad = pads.into_iter().flatten().fold(fallback(&keys, pointer), merged);
             self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
             self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
             return events;
@@ -494,7 +612,7 @@ impl State {
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys, pointer)));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -1131,11 +1249,136 @@ mod host {
         XINPUT_GAMEPAD_X, XINPUT_GAMEPAD_Y, XINPUT_STATE, XINPUT_VIBRATION, XInputGetState,
         XInputSetState,
     };
+    use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowThreadProcessId,
+        ClipCursor, GetCursorPos, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId,
+        SetCursorPos,
     };
 
     use super::*;
+
+    /// `VICTORY_MOUSE=1`: the mouse turns the camera, its buttons are the
+    /// triggers and the keys are [`MOUSE_BUTTONS`]' (off by default: the
+    /// mouse is left alone and the keys are as they were).
+    fn mouse_on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_MOUSE").is_some_and(|v| v == "1"))
+    }
+
+    /// `VICTORY_MOUSE_SPEED`: the mouse speed, in pixels a second, that is a
+    /// full stick (1400; smaller turns faster). `VICTORY_MOUSE_DEAD`: the
+    /// share of the stick the title ignores around its middle (0.12).
+    fn mouse_set() -> (f32, f32) {
+        static SET: std::sync::OnceLock<(f32, f32)> = std::sync::OnceLock::new();
+        *SET.get_or_init(|| {
+            let number = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<f32>().ok());
+            (
+                number("VICTORY_MOUSE_SPEED").filter(|v| *v >= 100.0).unwrap_or(1400.0),
+                number("VICTORY_MOUSE_DEAD").filter(|v| (0.0..0.9).contains(v)).unwrap_or(0.12),
+            )
+        })
+    }
+
+    /// What the mouse has been doing, between polls.
+    #[derive(Default)]
+    struct Mouse {
+        look: Look,
+        /// The window the pointer is held in, and when it was last read.
+        held: Option<(usize, Instant)>,
+        /// F8 lets the pointer go and takes it again.
+        free: bool,
+        drive: bool,
+        /// Caps Lock and F8 were down at the last poll.
+        was: (bool, bool),
+    }
+
+    const CAPS_LOCK: i32 = 0x14;
+    const F8: i32 = 0x77;
+
+    /// The foreground window if it is one of ours.
+    fn ours() -> Option<HWND> {
+        let mut process = 0;
+        // SAFETY: plain queries; a null window gives process 0.
+        unsafe {
+            let window = GetForegroundWindow();
+            GetWindowThreadProcessId(window, &mut process);
+            (process == GetCurrentProcessId() && !window.is_null()).then_some(window)
+        }
+    }
+
+    impl Mouse {
+        fn let_go(&mut self) {
+            if self.held.take().is_some() {
+                // SAFETY: lifts the limit this process set.
+                unsafe { ClipCursor(std::ptr::null()) };
+                MOUSE_HELD.store(false, Ordering::Relaxed);
+                self.look = Look::default();
+            }
+        }
+
+        fn poll(&mut self) -> Pointer {
+            // SAFETY: plain queries.
+            let down = |vk: i32| unsafe { GetAsyncKeyState(vk) } < 0;
+            let Some(window) = ours() else {
+                self.let_go();
+                self.was = (false, false);
+                return Pointer { on: true, drive: self.drive, ..Default::default() };
+            };
+            let now = (down(CAPS_LOCK), down(F8));
+            if now.0 && !self.was.0 {
+                self.drive = !self.drive;
+                tracing::info!(driving = self.drive, "keys: Caps Lock switched the layout");
+            }
+            if now.1 && !self.was.1 {
+                self.free = !self.free;
+                tracing::info!(free = self.free, "mouse: F8");
+            }
+            self.was = now;
+            let mut rect = RECT::default();
+            // SAFETY: room for the rectangle; a window of ours.
+            if self.free || unsafe { GetWindowRect(window, &mut rect) } == 0 {
+                self.let_go();
+                return Pointer { on: true, drive: self.drive, ..Default::default() };
+            }
+            // Away from the frame: a click during a fast movement must not
+            // land on the title bar or the border.
+            let inset = 48_i32.min((rect.right - rect.left) / 4).min((rect.bottom - rect.top) / 4);
+            let inner = RECT {
+                left: rect.left + inset,
+                top: rect.top + inset,
+                right: rect.right - inset,
+                bottom: rect.bottom - inset,
+            };
+            let centre = POINT { x: (rect.left + rect.right) / 2, y: (rect.top + rect.bottom) / 2 };
+            let mut at = POINT::default();
+            let time = Instant::now();
+            // SAFETY: room for the point; our own limit and position.
+            let moved = unsafe {
+                let read = GetCursorPos(&mut at) != 0;
+                ClipCursor(&inner);
+                SetCursorPos(centre.x, centre.y);
+                read
+            };
+            let (speed, dead) = mouse_set();
+            let stick = match self.held.replace((window as usize, time)) {
+                // The first look in this window: the pointer was anywhere.
+                Some((was, then)) if was == window as usize && moved => {
+                    let travel = ((at.x - centre.x) as f32, (at.y - centre.y) as f32);
+                    self.look.turn(travel, (time - then).as_secs_f32(), speed, dead)
+                }
+                _ => (0.0, 0.0),
+            };
+            MOUSE_HELD.store(true, Ordering::Relaxed);
+            Pointer {
+                on: true,
+                right_x: stick.0,
+                right_y: stick.1,
+                fire: down(0x01),
+                aim: down(0x02),
+                drive: self.drive,
+            }
+        }
+    }
 
     /// Asking XInput about an empty slot is slow; look again this often.
     const EMPTY_SLOT_RECHECK: Duration = Duration::from_secs(1);
@@ -1177,6 +1420,7 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        mouse: Mouse,
     }
 
     impl Source for Host {
@@ -1191,13 +1435,11 @@ mod host {
                 return None;
             }
             self.empty_until[slot] = None;
-            #[allow(unused_mut)]
             let mut pad = convert(&state.Gamepad);
             // The scripted keys (`VICTORY_KEYS`) also press the first
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
             // to the pad (the title's start screen) saw nothing.
-            #[cfg(feature = "diagnostics")]
             if slot == 0 {
                 for vk in scripted() {
                     if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
@@ -1208,11 +1450,16 @@ mod host {
             Some(pad)
         }
 
+        fn pointer(&mut self) -> Pointer {
+            if mouse_on() {
+                self.mouse.poll()
+            } else {
+                Pointer::default()
+            }
+        }
+
         fn keys(&mut self) -> Vec<KeyState> {
-            #[cfg(feature = "diagnostics")]
             let mut down = scripted();
-            #[cfg(not(feature = "diagnostics"))]
-            let mut down = Vec::new();
             if focused() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
@@ -1249,8 +1496,9 @@ mod host {
     /// 0.2 s that long after input starts (`<from>-<to>:<key>`: all that
     /// time), with or without focus. A key is a
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
-    /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
-    #[cfg(feature = "diagnostics")]
+    /// `Left`, `Right` (the stand-in pad's table maps them to buttons:
+    /// `Enter` is A). In every build, not only diagnostics ones: a launcher
+    /// uses it to press A on the start screen.
     fn scripted() -> Vec<u8> {
         static SCRIPT: LazyLock<(Instant, Vec<(Duration, Duration, u8)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
@@ -1575,6 +1823,71 @@ mod tests {
         release(r);
         // A keyboard reading is no gamepad reading.
         assert_eq!(current(hub, GAMEPAD_KIND, KEYBOARD), Err(READING_NOT_FOUND));
+    }
+
+    #[test]
+    fn the_mouse_is_the_right_stick_and_the_triggers() {
+        // Without the mouse the keys are as they were: I/J/K/L the right
+        // stick, C the right trigger, Space nothing.
+        let keys = [key(b'W'), key(SPACE), key(b'L'), key(b'C'), key(b'Q')];
+        assert_eq!(
+            fallback(&keys, Pointer::default()),
+            PadState {
+                buttons: LEFT_SHOULDER,
+                left_y: 1.0,
+                right_x: 1.0,
+                right_trigger: 1.0,
+                ..Default::default()
+            }
+        );
+        let pointer = Pointer { on: true, right_x: 0.5, right_y: -0.25, fire: true, aim: true, drive: false };
+        let pad = fallback(&keys, pointer);
+        assert_eq!(
+            pad,
+            PadState {
+                buttons: X | RIGHT_STICK | RIGHT_SHOULDER,
+                left_y: 1.0,
+                left_trigger: 1.0,
+                right_trigger: 1.0,
+                right_x: 0.5,
+                right_y: -0.25,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn driving_puts_the_pedals_on_w_and_s_and_the_handbrake_on_space() {
+        let drive = Pointer { on: true, drive: true, ..Default::default() };
+        let pad = fallback(&[key(b'W'), key(b'D'), key(SPACE)], drive);
+        assert_eq!(
+            pad,
+            PadState { buttons: RIGHT_SHOULDER, right_trigger: 1.0, left_x: 1.0, ..Default::default() }
+        );
+        let pad = fallback(&[key(b'S')], drive);
+        assert_eq!(pad, PadState { left_trigger: 1.0, ..Default::default() });
+    }
+
+    #[test]
+    fn mouse_travel_arrives_whole_and_the_stick_comes_to_rest() {
+        // 300 pixels to the right in 0.1 s, then nothing: the stick, summed
+        // over time at 1400 pixels a second for a full one, pays out 300.
+        let (speed, dt) = (1400.0, 0.008);
+        let mut look = Look::default();
+        let mut paid = 0.0;
+        let mut last = (0.0, 0.0);
+        for step in 0..200 {
+            let moved = if step < 12 { (25.0, 0.0) } else { (0.0, 0.0) };
+            last = look.turn(moved, dt, speed, 0.0);
+            assert!(last.0 >= 0.0 && last.0 <= 1.0 && last.1 == 0.0);
+            paid += last.0 * speed * dt;
+        }
+        assert!((paid - 300.0).abs() < 3.0, "{paid}");
+        assert_eq!(last, (0.0, 0.0));
+        // Up on the mouse (negative y) is up on the stick; a deflection
+        // starts above the share the title ignores.
+        let up = Look::default().turn((0.0, -10.0), dt, speed, 0.12);
+        assert!(up.0 == 0.0 && up.1 > 0.12 && up.1 < 0.5, "{up:?}");
     }
 
     #[test]

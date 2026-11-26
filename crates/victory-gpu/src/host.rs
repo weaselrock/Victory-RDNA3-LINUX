@@ -1054,6 +1054,15 @@ fn create() -> windows::core::Result<Host> {
             let amd = crate::indirect::amd(&device);
             victory_shader::emit::set_host_rdna(amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64);
         }
+        // Fixes for what vkd3d-proton and its drivers do are on by default
+        // only under Wine (`victory_shader::emit::set_host_wine`).
+        victory_shader::emit::set_host_wine(crate::wine::on_wine());
+        tracing::info!(
+            wine = crate::wine::on_wine(),
+            table_slot_words = victory_shader::emit::table_slot_words(),
+            raw_typed_loads = victory_shader::emit::raw_typed_loads(),
+            "Wine-only fixes"
+        );
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -9086,6 +9095,21 @@ impl Meter {
                     u8::from(crate::descriptor::host::show_new_later()),
                     crate::descriptor::host::NEW_LATER.load(Ordering::Relaxed)
                 );
+                if crate::pool::publish_safe() {
+                    tracing::info!(
+                        "every host texture new to lists sent before it, not only pooled ones; first uploads on the copy queue held for those lists (VICTORY_PUBLISH_SAFE), since the start: {} textures, {} held; slots switched once those lists had run: {}",
+                        crate::pool::UNSEEN_ANY.load(Ordering::Relaxed),
+                        crate::descriptor::host::AHEAD_HELD.load(Ordering::Relaxed),
+                        crate::descriptor::host::FLIPPED[0].load(Ordering::Relaxed)
+                    );
+                }
+                if crate::wine::on_wine() {
+                    tracing::info!(
+                        "root views bound to zeros (VICTORY_NULL_ROOTS), draws without a view heap of ours dropped (VICTORY_NO_HEAP_GUARD), since the start: {}, {}",
+                        crate::draw::NULL_ROOTS.load(Ordering::Relaxed),
+                        crate::draw::NO_HEAP_DROPPED.load(Ordering::Relaxed)
+                    );
+                }
                 if crate::resource::held_only() {
                     let [copies, bytes, grown, whole] = [0, 1, 2, 3].map(|i| crate::resource::HELD[i].load(Ordering::Relaxed));
                     let [flipped, missed] = [0, 1].map(|i| crate::descriptor::host::FLIPPED[i].load(Ordering::Relaxed));

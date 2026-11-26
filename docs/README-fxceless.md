@@ -280,6 +280,36 @@ title's window has focus:
 | F / H | stick clicks |
 | Esc, Tab | Menu, View |
 
+With `VICTORY_MOUSE=1` the mouse is part of that pad and the keys are laid out
+the way third-person titles are on a PC (off by default):
+
+| Keys and mouse | Pad |
+|----------------|-----|
+| mouse | right stick |
+| left / right button | right / left trigger |
+| W A S D | left stick |
+| left Shift, Enter | A |
+| R, Backspace | B |
+| Space, X | X |
+| F, Y | Y |
+| Tab / Q | left / right shoulder |
+| left Ctrl, G / C, H | left / right stick click |
+| arrows; E | D-pad; D-pad right |
+| V; Esc, P | View; Menu |
+| Z | left trigger |
+
+A pad has one set of buttons for walking and for driving, and a title does not
+say which it is at: **Caps Lock** switches the keys to driving and back (W and S
+are then the right and left trigger, Space the right shoulder; A and D still
+steer). The pointer is kept in the title's window and not shown while the
+window has focus; **F8** lets it go and takes it again.
+
+A stick sets how fast the camera turns and a mouse how far, so the mouse's
+travel is paid out as a deflection over a twentieth of a second.
+`VICTORY_MOUSE_SPEED` is the mouse speed, in pixels a second, that is a full
+stick (1400; smaller turns faster); `VICTORY_MOUSE_DEAD` the share of the stick
+a title ignores around its middle (0.12).
+
 ## Commands
 
 ```

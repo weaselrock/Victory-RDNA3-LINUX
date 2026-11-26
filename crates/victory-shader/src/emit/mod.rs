@@ -118,7 +118,10 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::{host_settings, set_host_max_wave, set_host_rdna, set_thread_max_wave};
+pub use lower::{
+    host_settings, raw_typed_loads, set_host_max_wave, set_host_rdna, set_host_wine, set_thread_max_wave,
+    table_slot_words,
+};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
@@ -182,6 +185,37 @@ pub fn group_sync() -> u8 {
         Some("1") => 1,
         _ => 2,
     })
+}
+
+/// Whether every loop gets one latch (`bitcode::Module::one_latch`): under
+/// Wine (`VICTORY_ONE_LATCH`: `0` never, `1` on any host). vkd3d-proton's
+/// DXIL converter recurses without end on loops with several back edges,
+/// which DXC never writes; Windows drivers take both forms, so nothing
+/// changes for a Windows host. Part of the translation: the shader cache
+/// keys on it (`victory-gpu`'s does).
+pub fn one_latch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var_os("VICTORY_ONE_LATCH") {
+        Some(v) => v != "0",
+        None => on_wine(),
+    })
+}
+
+/// Whether we run under Wine (its ntdll exports `wine_get_version`); the
+/// same probe as `victory_gpu::wine::on_wine`, which this crate cannot use.
+#[cfg(windows)]
+fn on_wine() -> bool {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    // SAFETY: plain lookups in ntdll, always loaded.
+    unsafe {
+        let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+        !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+    }
+}
+
+#[cfg(not(windows))]
+fn on_wine() -> bool {
+    false
 }
 
 /// Whether buffer atomics of the ray-tracing structure builder stand between
@@ -1547,6 +1581,34 @@ mod tests {
 
     /// A wave64 compute program: `body`, then a store of v1 to a UAV.
     fn stores_v1(body: &[u32]) -> Result<(), ShaderError> {
+        stores_v1_dxil(body).map(|_| ())
+    }
+
+    /// A program that stores to UAVs and synchronises its group reads 16-bit
+    /// integer typed views through the slot's raw view as well, with
+    /// `VICTORY_RAW_TYPED_LOADS` and the table's words (the face network's
+    /// Formula program read stale registers through its typed view on the
+    /// host); without a barrier, or with either switch off, it does not.
+    #[test]
+    fn typed_16_bit_loads_after_a_group_barrier_read_the_raw_view_when_switched_on() {
+        // s_barrier; buffer_load_format_d16_x v1, v0, s[8:11], 0 idxen; s_waitcnt vmcnt(0)
+        let with = [0xBF8A_0000u32, 0xE200_2000, 0x8002_0100, 0xBF8C_3F70];
+        let without = [0xE200_2000u32, 0x8002_0100, 0xBF8C_3F70];
+        let lowered = |body: &[u32], raw: bool, words: bool| {
+            let was = super::lower::TEST_RAW_TYPED_LOADS.replace(Some(raw));
+            let was_words = super::lower::TEST_TABLE_SLOT_WORDS.replace(Some(words));
+            let r = stores_v1_dxil(body);
+            super::lower::TEST_RAW_TYPED_LOADS.set(was);
+            super::lower::TEST_TABLE_SLOT_WORDS.set(was_words);
+            r.unwrap()
+        };
+        assert_ne!(lowered(&with, true, true), lowered(&with, false, true), "raw loads not taken");
+        assert_eq!(lowered(&with, true, false), lowered(&with, false, false), "raw loads without the table's words");
+        assert_eq!(lowered(&without, true, true), lowered(&without, false, true), "raw loads without a barrier");
+    }
+
+    /// [`stores_v1`]'s translation.
+    fn stores_v1_dxil(body: &[u32]) -> Result<Vec<u8>, ShaderError> {
         use crate::native::RootParam;
         use crate::{ResourceType, RootType, UsedResource};
         // s_mov_b32 s1, 0; s_load_dwordx4 s[8:11], s[0:1], 0
@@ -1589,7 +1651,7 @@ mod tests {
         let st = structure::structure(&p).unwrap();
         let container = crate::dxbc::build(&[]);
         let c = Container::parse(&container).unwrap();
-        emit(&c, &native, &p, &st, &io, &res).map(|_| ())
+        emit(&c, &native, &p, &st, &io, &res).map(|out| out.dxil)
     }
 
     /// The high dword of a wave64 mask rewritten alone (`s_mov_b32 vcc_hi`

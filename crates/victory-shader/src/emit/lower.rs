@@ -314,6 +314,9 @@ struct Lower<'a> {
     tail: Vec<Option<usize>>,
     /// The program writes UAVs: barriers fence them too.
     writes_uavs: bool,
+    /// 16-bit integer typed UAV loads read through the slot's raw view
+    /// ([`raw_typed_loads_on`]).
+    raw_typed_loads: bool,
     /// src0 of the current instruction as DPP fetched it.
     src0: Option<V>,
     /// Compute code that reads other lanes: thread ids follow the host
@@ -1512,10 +1515,83 @@ fn own_bits_on() -> bool {
 }
 
 /// What the translator was told of the host, for a cache's key: the widest
-/// wave, the view heap's limit, where the raw twins of its views start, and
-/// what it writes for the console's own hardware.
-pub fn host_settings() -> [u32; 4] {
-    [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views(), host_rdna()]
+/// wave, the view heap's limit, where the raw twins of its views start,
+/// what it writes for the console's own hardware, and the switches whose
+/// default is the host's (under Wine or not).
+pub fn host_settings() -> [u32; 5] {
+    let wine = u32::from(table_slot_words()) | u32::from(raw_typed_loads_on()) << 1;
+    [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views(), host_rdna(), wine]
+}
+
+static HOST_WINE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Tells the translator that the host runs under Wine (vkd3d-proton): the
+/// default of the switches that read [`wine_switch`].
+pub fn set_host_wine(on: bool) {
+    HOST_WINE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A switch on under Wine ([`set_host_wine`]) unless its variable `name`
+/// says otherwise: `0` off, any other value on.
+fn wine_switch(name: &str, env: &std::sync::OnceLock<Option<bool>>) -> bool {
+    env.get_or_init(|| std::env::var_os(name).map(|v| v != "0"))
+        .unwrap_or_else(|| HOST_WINE.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Whether descriptors a program reads through a descriptor table take the
+/// format kind of their view from the host's table by heap slot, as those
+/// it picks from the heap do, and the host enters the words of the slots
+/// it copies tables into (`VICTORY_TABLE_SLOT_WORDS`: on under Wine, `0`
+/// off, `1` on; untested on Windows). The face network (the 65
+/// `compute_graph_ops` programs, all bound through tables, their tensors in
+/// R16_UINT and R16G16B16A16_UINT views) otherwise reads its 16-bit
+/// integers as halves, then 0: its output, the R16_UINT buffer the head
+/// extract 970c4fbb3b017c0e reads, stays zero, faces do not move and eyes
+/// glow (the rig drives the eye meshes too).
+pub fn table_slot_words() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_TABLE_SLOT_WORDS.get() {
+        return on;
+    }
+    static ENV: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    wine_switch("VICTORY_TABLE_SLOT_WORDS", &ENV)
+}
+
+/// Whether a compute program that stores to UAVs and synchronises its group
+/// with `s_barrier` reads 16-bit integer typed buffer views (`_d16` loads of
+/// 1, 2 or 4 channels, the view's kind from the host's table by heap slot)
+/// through the slot's raw view instead (`VICTORY_RAW_TYPED_LOADS`: on under
+/// Wine, `0` off, `1` on; untested on Windows). On RADV through
+/// vkd3d-proton a typed (texel buffer) load after the group barrier could
+/// return what the buffer held before another wave's store that preceded
+/// the barrier; raw loads see it. The face network's Formula program
+/// (0aa7934094794dbf, an interpreter whose 1,024 threads keep a register
+/// file in an R16_UINT view, a barrier between its 12 stages), replayed
+/// from the title's buffers in the owner's tree: typed, its registers left
+/// a CPU model of its console code from stage 2 (1 register, 119 by stage
+/// 12) whatever the barrier's fence bits, globally coherent views or RADV's
+/// LLVM backend; one dispatch a stage, or raw loads, matched the model
+/// after every stage. Torn faces (mouths agape) before, whole ones after.
+fn raw_typed_loads_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_RAW_TYPED_LOADS.get() {
+        return on;
+    }
+    static ENV: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    wine_switch("VICTORY_RAW_TYPED_LOADS", &ENV)
+}
+
+/// See [`raw_typed_loads_on`], for the host's log.
+pub fn raw_typed_loads() -> bool {
+    raw_typed_loads_on()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`table_slot_words`], for its thread only.
+    pub(super) static TEST_TABLE_SLOT_WORDS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// A test's choice for [`raw_typed_loads_on`], for its thread only.
+    pub(super) static TEST_RAW_TYPED_LOADS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 static HOST_RDNA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1810,6 +1886,11 @@ impl<'a> Lower<'a> {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
+        let raw_typed_loads = raw_typed_loads_on()
+            && x.native.stage == HwStage::Cs
+            && writes_uavs
+            && insts().any(|i| i.name() == "s_barrier")
+            && insts().any(|i| matches!(i.fields, Fields::Buffer { .. }) && i.name().contains("load_format"));
         let mut console_lanes = false;
         // LDS accesses get a group barrier each (a console wave split in two host waves)
         let mut split_lds = false;
@@ -2094,6 +2175,7 @@ impl<'a> Lower<'a> {
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
             writes_uavs,
+            raw_typed_loads,
             src0: None,
             console_lanes,
             split_lds,
@@ -8101,7 +8183,7 @@ impl<'a> Lower<'a> {
     /// `ResourceHeap`): read from the host's table by heap slot in the
     /// current block.
     fn slot_stride(&mut self, src: &Source) -> Result<Option<V>, Why> {
-        let word = self.slot_word(src)?;
+        let word = self.slot_word(src, false)?;
         Ok(word.map(|word| {
             let bits = self.s.m.i32(super::shader::VIEW_STRIDE_BITS);
             self.s.m.bin(self.cur, Bin::And, word, bits)
@@ -8109,10 +8191,11 @@ impl<'a> Lower<'a> {
     }
 
     /// Whether the typed buffer view `src` names is one of an integer format,
-    /// and whether a signed one, as [`Self::slot_stride`] (`None`: a view the
-    /// program does not pick from the heap).
+    /// and whether a signed one, as [`Self::slot_stride`], and of a view read
+    /// through a table too with [`table_slot_words`] (`None`: a view the
+    /// host's table by heap slot does not describe).
     fn integer_view(&mut self, src: &Source) -> Result<Option<(V, V)>, Why> {
-        let Some(word) = self.slot_word(src)? else {
+        let Some(word) = self.slot_word(src, table_slot_words())? else {
             return Ok(None);
         };
         let c = self.cur;
@@ -8126,8 +8209,10 @@ impl<'a> Lower<'a> {
     }
 
     /// The host's word for the buffer view `src` names: its stride and
-    /// format kind ([`super::shader::SLOT_STRIDES`]).
-    fn slot_word(&mut self, src: &Source) -> Result<Option<V>, Why> {
+    /// format kind ([`super::shader::SLOT_STRIDES`]); of a view picked from
+    /// the heap, and with `tables` of one read through a table too (the host
+    /// enters the words of the slots it copies tables into).
+    fn slot_word(&mut self, src: &Source, tables: bool) -> Result<Option<V>, Why> {
         let Source::Loaded { load, first } = src else {
             return Ok(None);
         };
@@ -8135,7 +8220,7 @@ impl<'a> Lower<'a> {
             .scalar
             .get(load)
             .and_then(|a| self.x.native.layout.get(a.param))
-            .is_some_and(|p| p.root == RootType::ResourceHeap);
+            .is_some_and(|p| p.root == RootType::ResourceHeap || (tables && p.root == RootType::Table));
         if !heap {
             return Ok(None);
         }
@@ -12588,9 +12673,50 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
+        // The same element through the slot's raw view (its raw twin, or the
+        // slot itself where the host keeps none), where the view is a 16-bit
+        // integer one ([`raw_typed_loads_on`]): (taken, dwords).
+        let mut raw: Option<(V, Vec<V>)> = None;
         let r = if typed {
             if *offen || matches!(off, V::Inst(_)) || *offset != 0 {
                 return Err("a typed buffer load at an offset");
+            }
+            if uav
+                && d16
+                && matches!(count, 1 | 2 | 4)
+                && self.raw_typed_loads
+                && let Some(index) = index
+                && let Some(word) = self.slot_word(src, table_slot_words())?
+            {
+                let c = self.cur;
+                // Only views of 16-bit integer channels as many as loaded:
+                // their element is the loaded bytes.
+                let size = 2 * count;
+                let bits = self.s.m.i32(super::shader::VIEW_INTEGER | super::shader::VIEW_STRIDE_BITS);
+                let want = self.s.m.i32(super::shader::VIEW_INTEGER | size);
+                let kind = self.s.m.bin(c, Bin::And, word, bits);
+                let taken = self.s.m.cmp(c, pred::EQ, kind, want);
+                let h = self.handle(site, src, false, (11 | u, 0))?;
+                let k = self.s.m.i32(size);
+                let byte = self.s.m.bin(c, Bin::Mul, index, k);
+                let k3 = self.s.m.i32(3);
+                let within = self.s.m.bin(c, Bin::And, byte, k3);
+                let aligned = self.s.m.bin(c, Bin::Sub, byte, within);
+                let dwords = count.div_ceil(2);
+                let (mask, align) = (self.s.m.i8((1u8 << dwords) - 1), self.s.m.i32(4));
+                let l = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[h, aligned, iu, mask, align]);
+                let mut ws = Vec::new();
+                for d in 0..dwords {
+                    let f = self.s.m.extract(c, l, d);
+                    ws.push(self.as_int(f));
+                }
+                if count == 1 {
+                    let sh = self.s.m.bin(c, Bin::Shl, within, k3);
+                    let x = self.s.m.bin(c, Bin::LShr, ws[0], sh);
+                    let low = self.s.m.i32(0xFFFF);
+                    ws[0] = self.s.m.bin(c, Bin::And, x, low);
+                }
+                raw = Some((taken, ws));
             }
             if uav {
                 self.s.flags |= flags::TYPED_UAV_LOADS;
@@ -12680,7 +12806,11 @@ impl<'a> Lower<'a> {
                         None => h,
                     });
                 }
-                self.write(inst, Reg::V(reg + k as u8), x.expect("a channel"), guard);
+                let mut x = x.expect("a channel");
+                if let Some((taken, ws)) = &raw {
+                    x = self.s.m.select(c, *taken, ws[k as usize], x);
+                }
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
         }
@@ -14037,5 +14167,52 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    /// A d16 typed buffer load through a table asks the host's table by heap
+    /// slot for its view's format kind with `VICTORY_TABLE_SLOT_WORDS` (the
+    /// face network's compute_graph_ops programs, e.g. 0aa7934094794dbf,
+    /// load R16G16B16A16_UINT data this way and compute with it as
+    /// integers); without it, and for a 32-bit load, the program is as
+    /// before.
+    #[test]
+    fn a_d16_typed_buffer_load_through_a_table_reads_its_views_format_kind() {
+        let layout = vec![root(RootType::Table, 0, 0)];
+        let used = vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 4,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        let words = |d16: bool| {
+            // buffer_load_format(_d16)_xyzw v[1:..], v0, s[8:11], 0 idxen
+            let op: u32 = if d16 { 0x83 } else { 0x03 };
+            [
+                0xBE84_0300, // s_mov_b32 s4, s0
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0x38 << 26 | op << 18 | 1 << 13,
+                0x8002_0100,
+                0xBF8C_3F70, // s_waitcnt vmcnt(0)
+                0xD834_0000,
+                0x0000_0100, // ds_write_b32 v0, v1
+                S_ENDPGM,
+            ]
+        };
+        let table = |d16, on| {
+            let was = super::TEST_TABLE_SLOT_WORDS.replace(Some(on));
+            let l = lower_with(&words(d16), layout.clone(), used.clone());
+            super::TEST_TABLE_SLOT_WORDS.set(was);
+            l.unwrap().root_srvs.contains(&super::super::shader::SLOT_STRIDES)
+        };
+        assert!(table(true, true), "d16");
+        assert!(!table(false, true), "32-bit");
+        assert!(!table(true, false), "d16, switch off");
     }
 }
