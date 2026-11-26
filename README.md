@@ -1,13 +1,36 @@
-# VIctory on an RX 7900 XTX
+# Victory-RDNA3-LINUX
 
-A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
-that runs an Xbox Series title natively on Windows from files the user supplies.
+A **Linux-targeted fork** of
+[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)
+(based on [VIctory](https://github.com/Marvisak/VIctory)), focused on running
+an Xbox Series title on **Linux through Proton / Wine + vkd3d-proton on AMD
+RDNA 3 GPUs (Mesa RADV)**, including 32 GB RAM machines.
+
+See **[docs/proton.md](docs/proton.md)** for full Linux/Proton requirements,
+cross-building with `cargo-xwin`, the patched `wineserver`, and every Wine/RADV
+fix included here. All Wine/Proton workarounds activate automatically under
+Wine (`wine_get_version`) and leave Windows behavior unchanged.
+
+### Linux / Proton additions over upstream
+
+- **vkd3d-proton & RADV shader/pipeline fixes**: single-latch loop
+  normalization (`VICTORY_ONE_LATCH`), compute pipeline wait for once-only
+  dispatches (`VICTORY_COMPUTE_WAIT`), descriptor-table integer slot words
+  (`VICTORY_TABLE_SLOT_WORDS`), and raw 16-bit typed loads across barriers on
+  RADV (`VICTORY_RAW_TYPED_LOADS`).
+- **GPU & memory stability under Wine**: safe descriptor publication
+  (`VICTORY_PUBLISH_SAFE`), zero-address and null-buffer guards
+  (`VICTORY_NULL_BUFFER_ZEROS`), hardened texture read-back
+  (`VICTORY_FETCH_MARK`), and runtime placeholder hole tracking to avoid
+  per-frame `VirtualQuery` lock contention (`VICTORY_WINE_HOLES`).
+- **PC mouse + keyboard input**: opt-in `VICTORY_MOUSE=1` camera/trigger mouse
+  support (see [docs/README-fxceless.md](docs/README-fxceless.md)).
 
 ## The goal
 
 **A stable 30 fps or more without ray tracing, then as high a frame rate and as
-low frame times as the PC allows**, on an AMD RX 7900 XTX first and on PCs with
-32 GB (later 16 GB) of RAM.
+low frame times as the PC allows**, targeting Linux (Proton + Mesa RADV) on AMD
+RDNA 3 (RX 7900 XTX) and PCs with 32 GB (later 16 GB) of RAM.
 
 The way there is **porting, not emulating**: patching the title's renderer so it
 behaves the way a PC renderer does, rather than having the layer watch and copy
@@ -53,13 +76,27 @@ What is known to be wrong:
 
 ## How to run it
 
+### Linux (Proton / Wine + Mesa RADV — primary target)
+
+Follow **[docs/proton.md](docs/proton.md)** for full setup details (Proton
+Experimental, the view-tree `wineserver` patch, `d3dcompiler_47.dll` build
+10.0.26100, and `cargo-xwin`):
+
+```bash
+git clone https://github.com/weaselrock/Victory-RDNA3-LINUX
+cd Victory-RDNA3-LINUX
+cargo xwin build --release -p victory --target x86_64-pc-windows-msvc
+```
+
+### Windows (upstream target)
+
 You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader
 model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build
 tools, and your own dump of the title.
 
 ```powershell
-git clone https://github.com/avatarmanz/VIctory-7900XTX
-cd VIctory-7900XTX
+git clone https://github.com/weaselrock/Victory-RDNA3-LINUX
+cd Victory-RDNA3-LINUX
 copy victory.example.toml victory.toml      # then set your paths, outside this folder
 cargo build --locked --profile diag -p victory --features diagnostics
 scripts\play.ps1 -Exe <path of your copy's executable>
@@ -113,6 +150,8 @@ In short; the reasons and the measurements are in [docs/findings.md](docs/findin
 This is a tree of other people's work with more on top. The history is kept, and
 commits taken from elsewhere name the commit and its author.
 
+- **[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)**:
+  the direct upstream AMD RDNA 3 fork this Linux-targeted fork is built on.
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
   contributors: the loader, the runtime services, the Direct3D 12 back end and
   the shader recompiler.

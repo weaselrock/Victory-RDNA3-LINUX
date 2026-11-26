@@ -153,8 +153,7 @@ Switch: `VICTORY_RAW_TYPED_LOADS`.
   its heap slot only when no submission is in flight. Switch:
   `VICTORY_PUBLISH_SAFE`.
 - At addresses near 0: passes handed address 0 read zeros there, and null
-  buffer views read zeros. Switches: `VICTORY_MEMORY_RUN_FIRST`,
-  `VICTORY_NULL_BUFFER_ZEROS`.
+  buffer views read zeros. Switch: `VICTORY_NULL_BUFFER_ZEROS`.
 
 ### Everything sinks in water
 
