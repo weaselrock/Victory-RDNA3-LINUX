@@ -80,13 +80,34 @@ What is known to be wrong:
 
 Follow **[docs/proton.md](docs/proton.md)** for full setup details (Proton
 Experimental, the view-tree `wineserver` patch, `d3dcompiler_47.dll` build
-10.0.26100, and `cargo-xwin`):
+10.0.26100, and `cargo-xwin`), or use the helper scripts under `scripts/linux/`:
 
 ```bash
 git clone https://github.com/weaselrock/Victory-RDNA3-LINUX
 cd Victory-RDNA3-LINUX
-cargo xwin build --release -p victory --target x86_64-pc-windows-msvc
+
+# Optional one-time setup for speed and VK_EXT_descriptor_heap on RDNA 3:
+bash scripts/linux/build-fast-wineserver.sh
+bash scripts/linux/build-radv.sh
+
+# First run (supply Microsoft's 64-bit d3dcompiler_47.dll 10.0.x):
+D3DCOMPILER_DLL=/path/to/d3dcompiler_47.dll \
+  bash scripts/linux/run-victory-lowmem.sh --game-dir /path/to/dump
+
+# Later runs:
+bash scripts/linux/run-victory-lowmem.sh --game-dir /path/to/dump
 ```
+
+Helper scripts included in `scripts/linux/`:
+- `run-victory-lowmem.sh`: builds with `cargo-xwin`, sets up the Proton prefix,
+  and launches with `--game-dir <dir>` (or `--exe <path>`, or `GAME_DIR`),
+  memory limits, and per-run logs (`warm` precompiles recorded pipelines).
+- `build-fast-wineserver.sh`: builds a patched Proton copy with the Wine bug
+  60868 view-tree `wineserver` (`wineserver-view-tree.patch.txt`).
+- `build-radv.sh`: builds standalone Mesa 26.3.1 RADV without touching the
+  system driver.
+- `profile-victory.sh` / `profile-victory-calls.sh`: Linux `perf` CPU and
+  syscall profilers for a running session.
 
 ### Windows (upstream target)
 
