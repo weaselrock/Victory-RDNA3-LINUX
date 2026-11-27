@@ -501,8 +501,12 @@ fn workers() -> bool {
         let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
         for i in 0..workers + screens {
             let screens_only = i >= workers;
+            // The host driver compiles on this thread: vkd3d-proton's DXIL
+            // to SPIR-V recursion can pass the default 2 MiB (Wine, RADV).
+            // Reserved, not committed.
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
+                .stack_size(64 << 20)
                 .spawn(move || {
                     // Below the title's own threads (loading, recording),
                     // and the streaming one, which is below normal itself

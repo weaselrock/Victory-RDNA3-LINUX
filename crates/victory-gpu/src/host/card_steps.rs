@@ -544,6 +544,30 @@ fn record(
     reads: &[(&ID3D12Resource, u64, u64, u64)],
     writes: &[(&ID3D12Resource, u64, u64, u64)],
 ) {
+    // Every range is checked against its buffer and the staging buffer before
+    // it is recorded: vkd3d-proton does not validate CopyBufferRegion, and on
+    // RADV a range past a buffer's end is a write by the card's command
+    // processor to an address of no allocation — a GPU page fault and, when the
+    // queue reset fails, a whole-GPU reset that takes the desktop with it
+    // (2026-11-26: CPC write at 0xfffffffff000 on vkd3d's compute queue).
+    let fits = |&&(buffer, offset, at, len): &&(&ID3D12Resource, u64, u64, u64)| {
+        // SAFETY: a plain query of a live buffer.
+        let width = unsafe { buffer.GetDesc() }.Width;
+        let ok = len != 0
+            && offset.checked_add(len).is_some_and(|end| end <= width)
+            && at.checked_add(len).is_some_and(|end| end <= BETWEEN);
+        if !ok {
+            static SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 16 || n.is_power_of_two() {
+                tracing::warn!(offset, at, len, width, skipped = n + 1, "card step: a copy out of its buffer's range left out");
+            }
+        }
+        ok
+    };
+    let reads: Vec<_> = reads.iter().filter(fits).copied().collect();
+    let writes: Vec<_> = writes.iter().filter(fits).copied().collect();
+    let (reads, writes) = (&reads[..], &writes[..]);
     let common = D3D12_RESOURCE_STATE_COMMON;
     let (source, dest) = (D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
     let mut sources: Vec<&ID3D12Resource> = Vec::new();

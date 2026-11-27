@@ -1431,6 +1431,18 @@ mod host {
             let mut state = XINPUT_STATE::default();
             // SAFETY: room for the state.
             if unsafe { XInputGetState(slot as u32, &mut state) } != 0 {
+                // A scripted run with no pad gets a host pad in slot 0: the
+                // title's account screen does not take the stand-in's A.
+                #[cfg(feature = "diagnostics")]
+                if slot == 0 && std::env::var_os("VICTORY_KEYS").is_some() {
+                    let mut pad = convert(&state.Gamepad);
+                    for vk in scripted() {
+                        if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
+                            pad.buttons |= button;
+                        }
+                    }
+                    return Some(pad);
+                }
                 self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
                 return None;
             }
