@@ -1242,6 +1242,26 @@ mod tests {
     }
 
     #[test]
+    fn reset_forgets_bound_pipelines_root_uploads_and_gpu_written() {
+        let mut deferred = super::Deferred::default();
+        deferred.bound.insert(1);
+        deferred.filled.insert((2, 256), 3);
+        deferred.gpu_written.insert((4, 5, 6));
+        deferred.texture_aliases.insert(8, 9);
+        deferred.budget_zeroed = true;
+        deferred.indirect_readable = 7;
+
+        deferred.clear();
+
+        assert!(deferred.bound.is_empty());
+        assert!(deferred.filled.is_empty());
+        assert!(deferred.gpu_written.is_empty());
+        assert!(deferred.texture_aliases.is_empty());
+        assert!(!deferred.budget_zeroed);
+        assert_eq!(deferred.indirect_readable, 0);
+    }
+
+    #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
         use windows_sys::Win32::System::Memory::*;
         const N: usize = 5 << 16;
@@ -2426,6 +2446,8 @@ struct Deferred {
     filled: std::collections::HashMap<(usize, usize), u64, std::hash::BuildHasherDefault<AddressHash>>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
+    /// Last GPU source copied into each aliased host texture in this list.
+    texture_aliases: std::collections::HashMap<usize, usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -2465,6 +2487,51 @@ impl Deferred {
         self.refreshed.clear();
         self.gpu_written.clear();
         self.filled.clear();
+    }
+
+    /// Empties the recording for the list's next use, keeping the capacity
+    /// of every collection (a reset is per submission, and the sets and
+    /// vectors grow back the same way every time). The same state
+    /// [`Deferred::default`] gives, so nothing leaks across resets: the
+    /// held uploads pass out of [`ALIVE`] as they would when dropped.
+    fn clear(&mut self) {
+        // Every field belongs to one recording. Adding one must also decide how it resets.
+        let Self {
+            copies,
+            uploads,
+            upload_bytes,
+            kept,
+            bound,
+            refreshed,
+            gpu_written,
+            filled,
+            textures,
+            texture_aliases,
+            writes,
+            backs,
+            back_wanted,
+            texture_backs,
+            budget_zeroed,
+            indirect_readable,
+        } = self;
+        ALIVE[6].fetch_sub(uploads.len() as u64, Ordering::Relaxed);
+        ALIVE[7].fetch_sub(*upload_bytes, Ordering::Relaxed);
+        copies.clear();
+        uploads.clear();
+        *upload_bytes = 0;
+        kept.clear();
+        bound.clear();
+        refreshed.clear();
+        gpu_written.clear();
+        filled.clear();
+        textures.clear();
+        texture_aliases.clear();
+        writes.clear();
+        backs.clear();
+        back_wanted.clear();
+        texture_backs.clear();
+        *budget_zeroed = false;
+        *indirect_readable = 0;
     }
 }
 
@@ -6563,7 +6630,7 @@ impl HostList {
         let _resetting = crate::timeline::span("resetting a host list");
         self._alive.used();
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *self.deferred() = Deferred::default();
+        self.deferred().clear();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -7485,6 +7552,16 @@ impl HostList {
     /// reset.
     pub(crate) fn used(&self, key: usize) -> bool {
         self.deferred().textures.contains(&key)
+    }
+
+    pub(crate) fn alias_source_changed(
+        &self,
+        view: &ID3D12Resource,
+        source: &ID3D12Resource,
+    ) -> bool {
+        let view = view.as_raw() as usize;
+        let source = source.as_raw() as usize;
+        self.deferred().texture_aliases.insert(view, source) != Some(source)
     }
 
     /// Runs `work` when the list is submitted, in order with its copies.
@@ -8645,6 +8722,17 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
         return unsafe { crate::safecopy::copy(dst, src, len) };
     }
     let mut done = 0;
+    if direct_writes() {
+        // SAFETY: the destination is mapped writable memory of `len` bytes;
+        // the kernel checks the source. A short or partial read returns a
+        // negative status (`STATUS_PARTIAL_COPY`), which leaves the piece
+        // walk in `read_pieces` to zero what cannot be read; `done == len`
+        // keeps that true of a success that is somehow short.
+        let status = unsafe {
+            NtReadVirtualMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done)
+        };
+        return status >= 0 && done == len;
+    }
     // SAFETY: the destination is mapped writable memory of `len` bytes; the
     // kernel checks the source.
     unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
@@ -8662,6 +8750,18 @@ unsafe extern "system" {
         size: usize,
         written: *mut usize,
     ) -> i32;
+
+    /// The kernel's read from a process's memory, `(process, address,
+    /// bytes, length, read out)`: an NTSTATUS, negative when a page of the
+    /// range is not there or not readable (`STATUS_PARTIAL_COPY` when only
+    /// part of it is). It changes no protection.
+    fn NtReadVirtualMemory(
+        process: *mut std::ffi::c_void,
+        base: *const std::ffi::c_void,
+        buffer: *mut std::ffi::c_void,
+        size: usize,
+        read: *mut usize,
+    ) -> i32;
 }
 
 /// Whether title memory is written with the kernel's own call
@@ -8669,7 +8769,9 @@ unsafe extern "system" {
 /// what the pages are (as `VirtualQuery` does: about 2 ms a call in the
 /// title's big pools, see [`copy_mapped`]): putting back what shaders wrote
 /// cost 1.2-1.9 s a frame for 430-800 pieces, 2 ms each whatever their size
-/// (run 24). On by default; `VICTORY_DIRECT_WRITES=0` writes as before.
+/// (run 24). The same switch reads with `NtReadVirtualMemory`, as
+/// `ReadProcessMemory` asks the same question. On by default;
+/// `VICTORY_DIRECT_WRITES=0` writes and reads as before.
 fn direct_writes() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_DIRECT_WRITES").is_none_or(|v| v != "0"))

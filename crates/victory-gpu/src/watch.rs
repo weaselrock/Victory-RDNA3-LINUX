@@ -2069,7 +2069,10 @@ pub(crate) static ALIASES: [std::sync::atomic::AtomicU64; 3] = [const { std::syn
 /// it), a write through it would not be seen: that block is not clean, and
 /// told as written at every asking, until it can. Whether all are covered.
 fn cover(g: &mut Guards, from: usize, to: usize) -> bool {
-    let mut all = true;
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    let rest_ms = rest();
+    let mut entries: Vec<(usize, Vec<usize>)> = Vec::new();
+    let mut alias_blocks: Vec<usize> = Vec::new();
     for (page, others) in elsewhere(from * BLOCK, (to - from) * BLOCK) {
         let block = page / BLOCK;
         if !g.protected.contains(block) {
@@ -2078,11 +2081,72 @@ fn cover(g: &mut Guards, from: usize, to: usize) -> bool {
         #[cfg(feature = "diagnostics")]
         ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         g.aliased.insert(block);
-        let mut covered = true;
+        let mut alias_list = Vec::with_capacity(others.len());
         for other in others {
-            covered &= protect_alias(g, other / BLOCK);
+            let alias = other / BLOCK;
+            g.aliased.insert(alias);
+            alias_list.push(alias);
+            if !g.protected.contains(alias) && !g.left_alone(alias) && !g.rests(alias, rest_ms) {
+                alias_blocks.push(alias);
+            }
         }
-        if !covered {
+        entries.push((block, alias_list));
+    }
+    if alias_blocks.len() > 1 {
+        alias_blocks.sort_unstable();
+        alias_blocks.dedup();
+    }
+    let mut at = 0;
+    while at < alias_blocks.len() {
+        let run_start = alias_blocks[at];
+        let mut run_end = run_start + 1;
+        at += 1;
+        while at < alias_blocks.len() && alias_blocks[at] == run_end {
+            run_end += 1;
+            at += 1;
+        }
+        let n = run_end - run_start;
+        if n == 1 {
+            let _ = protect_alias(g, run_start);
+            continue;
+        }
+        // Ahead of the protection (`PROTECTED`).
+        (run_start..run_end).for_each(|b| PROTECTED.set(b));
+        let mut old = 0;
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        // SAFETY: title view memory; only its protection changes.
+        let mut done = unsafe {
+            VirtualProtect((run_start * BLOCK) as *const _, n * BLOCK, PAGE_READONLY, &mut old) != 0
+        };
+        if done && !matches!(old, PAGE_READWRITE | PAGE_READONLY) {
+            // SAFETY: as above; not for us to guard.
+            unsafe { VirtualProtect((run_start * BLOCK) as *const _, n * BLOCK, old, &mut old) };
+            done = false;
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            tally(5, n as u64);
+            tally(8, started.elapsed().as_nanos() as u64);
+        }
+        if done {
+            g.protected.insert_all(run_start..run_end);
+            #[cfg(feature = "diagnostics")]
+            for b in run_start..run_end {
+                crate::faultbook::note(crate::faultbook::What::Alias, b, 0, 0);
+            }
+        } else {
+            // A run can span views the kernel only lets be guarded one
+            // region at a time, leaving out the ones that fail.
+            (run_start..run_end).for_each(|b| PROTECTED.clear(b));
+            for b in run_start..run_end {
+                let _ = protect_alias(g, b);
+            }
+        }
+    }
+    let mut all = true;
+    for (block, others) in entries {
+        if !others.into_iter().all(|alias| g.protected.contains(alias)) {
             all = false;
             g.clean.remove(block);
         }
@@ -2252,6 +2316,9 @@ fn open(g: &mut Guards, start: usize, end: usize) -> usize {
 /// Gives write access back to `blocks`, guarded ones.
 fn unguard(g: &mut Guards, blocks: &[usize]) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    if blocks.is_empty() {
+        return;
+    }
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // All of them before the first can be written: a write through one is a
@@ -2261,7 +2328,7 @@ fn unguard(g: &mut Guards, blocks: &[usize]) {
         g.clean.remove(block);
         PUBLISHED.clear(block);
     }
-    for &block in blocks {
+    let unguard_one = |block: usize| {
         let mut old = 0;
         // SAFETY: a block we made read-only.
         unsafe {
@@ -2274,11 +2341,58 @@ fn unguard(g: &mut Guards, blocks: &[usize]) {
             }
         }
         PROTECTED.clear(block);
+    };
+    if blocks.len() == 1 {
+        unguard_one(blocks[0]);
+    } else {
+        // Coalesce contiguous runs into one VirtualProtect call: a long write
+        // (`fread` or landing) opens many blocks, and each call walks page tables.
+        let mut sorted: Vec<usize> = blocks.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let mut at = 0;
+        while at < sorted.len() {
+            let run_start = sorted[at];
+            let mut run_end = run_start + 1;
+            at += 1;
+            while at < sorted.len() && sorted[at] == run_end {
+                run_end += 1;
+                at += 1;
+            }
+            let n = run_end - run_start;
+            if n == 1 {
+                unguard_one(run_start);
+                continue;
+            }
+            let mut old = 0;
+            // SAFETY: blocks we made read-only.
+            let set = unsafe {
+                VirtualProtect((run_start * BLOCK) as *const _, n * BLOCK, PAGE_READWRITE, &mut old)
+            };
+            if set != 0 && matches!(old, PAGE_READONLY | PAGE_READWRITE) {
+                for block in run_start..run_end {
+                    PROTECTED.clear(block);
+                }
+            } else if set != 0 {
+                // First block was not ours to make writable: restore it, then
+                // verify the remaining blocks one by one.
+                // SAFETY: as above.
+                unsafe { VirtualProtect((run_start * BLOCK) as *const _, BLOCK, old, &mut old) };
+                PROTECTED.clear(run_start);
+                for block in run_start + 1..run_end {
+                    unguard_one(block);
+                }
+            } else {
+                // A run can span a placeholder and the views over it, which the
+                // kernel only lets be given back one region at a time.
+                for block in run_start..run_end {
+                    unguard_one(block);
+                }
+            }
+        }
     }
     #[cfg(feature = "diagnostics")]
-    if !blocks.is_empty() {
-        tally(8, started.elapsed().as_nanos() as u64);
-    }
+    tally(8, started.elapsed().as_nanos() as u64);
 }
 
 /// Before our own write into title memory `[at, at + len)` through the
