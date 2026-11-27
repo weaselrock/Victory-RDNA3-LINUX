@@ -28,6 +28,11 @@ pub(super) mod intersect;
 
 type Why = &'static str;
 
+/// `DB_SHADER_CONTROL` bits: the program exports depth (`Z_EXPORT_ENABLE`);
+/// depth and stencil are tested before it runs (`DEPTH_BEFORE_SHADER`).
+const Z_EXPORT: u32 = 1;
+const DEPTH_BEFORE_SHADER: u32 = 1 << 12;
+
 /// How an interpolation evaluates an input channel.
 #[derive(Debug, Clone, Copy)]
 enum Eval {
@@ -432,6 +437,8 @@ enum MaskData {
 
 /// What a value holding a lane mask read as a number stops with.
 pub(super) const LANE_MASK: Why = "a lane mask read as data";
+/// A lane test of a constant mask where host lanes are not the console's.
+pub(super) const CONSTANT_MASK: Why = "a constant lane mask";
 /// A mask with lanes outside EXEC where it is written, read as a number where the lanes that
 /// run that block are not all of the wave.
 pub(super) const MASK_ELSEWHERE: Why = "a lane mask holding lanes elsewhere read as data";
@@ -1882,6 +1889,19 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        // `DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER` (bit 12): the console tests
+        // depth and stencil before the program runs. A host tests after a
+        // program with unordered writes unless told otherwise, and the
+        // program then writes for pixels the test rejects (a glass pre-pass
+        // marked the pane's pixels behind a head as glass).
+        if let StageIo::Ps {
+            db_shader_control, ..
+        } = x.native.io
+            && db_shader_control & DEPTH_BEFORE_SHADER != 0
+            && db_shader_control & Z_EXPORT == 0
+        {
+            s.flags |= flags::EARLY_DEPTH;
+        }
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
@@ -4717,7 +4737,7 @@ impl<'a> Lower<'a> {
                 Ok(self.lane_bit(at, lo, Some(hi)))
             }
             Atom::Opaque(_) => Err("an opaque lane mask"),
-            Atom::Constant(_) => Err("a constant lane mask"),
+            Atom::Constant(_) => Err(CONSTANT_MASK),
         }
     }
 
@@ -12837,7 +12857,16 @@ impl<'a> Lower<'a> {
         if let Some(g) = guard
             && !mesh
         {
-            if !(e.done && self.s.pixel) {
+            // A pixel's colour export before its last one, under the same EXEC: the lanes
+            // outside it are killed at the last one (a lane of a live quad that runs on as a
+            // helper gets here too, [`crate::structure`]).
+            let same_as_done = self.s.pixel
+                && !e.done
+                && (i + 1..self.x.p.blocks[b].insts.len()).any(|k| {
+                    self.exports.get(&(b, k)).is_some_and(|d| d.done)
+                        && self.x.st.guards[b][k] == self.x.st.guards[b][i]
+                });
+            if !(e.done && self.s.pixel || same_as_done) {
                 return Err("a conditional export");
             }
             let t = self.s.m.bool(true);

@@ -278,7 +278,8 @@ pub enum StageIo {
         inputs: Vec<PsInput>,
         /// `SPI_PS_INPUT_ADDR`: which system values arrive in VGPRs.
         input_addr: u32,
-        /// `DB_SHADER_CONTROL`: depth export, kill.
+        /// `DB_SHADER_CONTROL`: depth export, kill, depth test before the
+        /// program.
         db_shader_control: u32,
         patches: Vec<ExportPatch>,
     },
