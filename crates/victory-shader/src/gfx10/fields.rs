@@ -742,7 +742,16 @@ fn salu_dwords(name: &str) -> (u8, u8, u8) {
 
 /// (vdst, [src0, src1, src2]) dwords of a VALU opcode.
 fn valu_dwords(name: &str) -> (u8, [u8; 3]) {
-    let parts: Vec<&str> = name.split('_').collect();
+    // The first four `_` parts and how many there are (no allocation: this
+    // runs for every VALU instruction).
+    let mut parts = [""; 4];
+    let mut count = 0;
+    for (k, part) in name.split('_').enumerate() {
+        if let Some(slot) = parts.get_mut(k) {
+            *slot = part;
+        }
+        count = k + 1;
+    }
     match name {
         "v_lshlrev_b64" | "v_lshrrev_b64" | "v_ashrrev_i64" => (2, [1, 2, 2]),
         "v_ldexp_f64" | "v_trig_preop_f64" | "v_cmp_class_f64" | "v_cmpx_class_f64" => {
@@ -752,11 +761,11 @@ fn valu_dwords(name: &str) -> (u8, [u8; 3]) {
         "v_qsad_pk_u16_u8" | "v_mqsad_pk_u16_u8" => (2, [2, 1, 2]),
         "v_mqsad_u32_u8" => (4, [2, 1, 4]),
         "v_frexp_exp_i32_f64" => (1, [2; 3]),
-        _ if parts.len() == 4 && parts[1] == "cvt" => {
+        _ if count == 4 && parts[1] == "cvt" => {
             (type_dwords(parts[2]), [type_dwords(parts[3]); 3])
         }
         _ => {
-            let n = type_dwords(parts.last().copied().unwrap_or(""));
+            let n = type_dwords(name.rsplit('_').next().unwrap_or(""));
             (n, [n; 3])
         }
     }

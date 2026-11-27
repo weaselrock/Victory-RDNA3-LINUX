@@ -30,7 +30,7 @@
 //! Which passes run is `emit::shader_opt()` (`VICTORY_SHADER_OPT`), part of
 //! the translation and so of the shader cache's key.
 
-use std::collections::HashMap;
+use crate::fx::Map as HashMap;
 
 use super::{
     Attr, Bin, Cast, Const, Func, MdDef, Module, Op, Term, Ty, TypeDef, V, for_each_operand, pred,
@@ -798,9 +798,9 @@ impl Module {
         }
         // The values every path to the block being walked has computed
         // (those of the blocks above it in the tree, and its own so far).
-        let mut known: HashMap<Key, V> = HashMap::new();
+        let mut known: HashMap<Key, V> = HashMap::default();
         // The reads of the block being walked since its last store.
-        let mut read: HashMap<Key, V> = HashMap::new();
+        let mut read: HashMap<Key, V> = HashMap::default();
         let mut facts = Facts::default();
         let (yes, no) = (self.bool(true), self.bool(false));
         enum Step {
@@ -843,7 +843,7 @@ impl Module {
             read.clear();
             // Two joins of the same values from the same blocks are one.
             if passes & REUSE != 0 && self.blocks[b].phis.len() > 1 {
-                let mut joins: HashMap<Vec<(usize, V)>, V> = HashMap::new();
+                let mut joins: HashMap<Vec<(usize, V)>, V> = HashMap::default();
                 for &p in &self.blocks[b].phis {
                     if repl[p as usize].is_some() {
                         continue;
@@ -852,11 +852,9 @@ impl Module {
                     let Op::Phi(incoming) = &self.insts[p as usize].op else {
                         continue;
                     };
-                    let mut key: Vec<(usize, V)> = incoming
-                        .iter()
-                        .map(|&(v, from)| (from, resolve(&repl, v)))
-                        .collect();
-                    key.sort();
+                    let mut key: Vec<(usize, V)> = Vec::with_capacity(incoming.len() + 1);
+                    key.extend(incoming.iter().map(|&(v, from)| (from, resolve(&repl, v))));
+                    key.sort_unstable();
                     // The type too: an undefined value of one type is not
                     // that of another.
                     key.push((ty.0 as usize, V::Global(u32::MAX)));

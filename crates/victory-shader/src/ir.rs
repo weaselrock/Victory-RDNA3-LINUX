@@ -294,6 +294,11 @@ fn unspill(
             _ => None,
         }
     }
+    // Nothing parked (most programs): nothing to undo, and no need to work
+    // out every instruction's effects.
+    if !list.iter().any(|i| matches!(i.name(), Some("v_writelane_b32" | "v_readlane_b32"))) {
+        return Vec::new();
+    }
     // VGPRs used by parking alone, the scalar codes the program uses, and
     // per instruction the scalar codes it writes.
     let mut stores = [false; 256];

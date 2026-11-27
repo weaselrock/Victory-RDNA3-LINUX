@@ -10,6 +10,7 @@ pub mod bvh;
 pub mod dxbc;
 pub mod dxil;
 pub mod emit;
+mod fx;
 pub mod gfx10;
 pub mod io;
 pub mod ir;

@@ -6,7 +6,8 @@
 //! emitter cannot express is `Missing` with a reason, and only fails the
 //! program when something with an effect (an export, a branch) needs it.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use crate::fx::{Map as HashMap, Set as HashSet};
+use std::collections::BTreeMap;
 
 use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Rmw, Tag, Term, V, pred};
@@ -111,7 +112,7 @@ fn counted_in_threads(parts: &Parts) -> bool {
 /// at once (`shader.rs` `USER_DISPATCH_THREADS_X`; after DexNom/VIctory
 /// bc3cd4b0, which does so for two of the programs by their digests).
 pub(super) fn lower_counted(parts: &Parts, counted: bool) -> Result<Lowered, ShaderError> {
-    let mut bad = HashMap::new();
+    let mut bad = HashMap::default();
     loop {
         match Lower::new(parts, &bad).run(counted) {
             Ok(l) => return Ok(l),
@@ -156,7 +157,7 @@ fn ordered_section(p: &Program) -> HashSet<Site> {
         i.name() == "s_sendmsg"
             && matches!(i.fields, Fields::Sopp { imm } if imm & 0xF == ORDERED_PS_DONE)
     };
-    let mut section = HashSet::new();
+    let mut section = HashSet::default();
     let mut entered = vec![false; p.blocks.len()];
     let mut work: Vec<Site> = p
         .blocks
@@ -386,7 +387,7 @@ struct Lower<'a> {
     /// IR block being lowered.
     cur_ir: usize,
     /// Whole-wave sections by block and start index.
-    sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
+    sections: HashMap<usize, std::collections::HashMap<usize, super::wave::Section>>,
     /// Values written in a section that code outside it reads.
     section_out: HashSet<Value>,
     /// The program's constant table (the code from the first byte read
@@ -570,7 +571,7 @@ fn lane_uniform(
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
     let order = crate::ir::reverse_postorder(&p.blocks);
     let regions = lane_regions(st);
-    let mut same: HashSet<Value> = HashSet::new();
+    let mut same: HashSet<Value> = HashSet::default();
     loop {
         // An atom of a lane condition that every lane of a console wave holds alike.
         let alike_atom = |same: &HashSet<Value>, a: &Atom| match *a {
@@ -603,7 +604,7 @@ fn lane_uniform(
             }
             None => all.to_vec(),
         };
-        let mut next: HashSet<Value> = HashSet::new();
+        let mut next: HashSet<Value> = HashSet::default();
         for &b in &order {
             let block = &p.blocks[b];
             let whole = block
@@ -1044,8 +1045,8 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
         }
         Ok(())
     };
-    let mut kind: HashMap<Value, Wave> = HashMap::new();
-    let mut firsts: HashSet<Value> = HashSet::new();
+    let mut kind: HashMap<Value, Wave> = HashMap::default();
+    let mut firsts: HashSet<Value> = HashSet::default();
     // to a fixpoint (values carried around loops), then once more to say what is wrong
     let mut settled = false;
     for _ in 0..16 {
@@ -1173,7 +1174,7 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
 fn lds_flag_region(p: &Program, st: &Structured, blocks: &[usize]) -> bool {
     let inside: HashSet<usize> = blocks.iter().copied().collect();
     // where each value is written: (block, instruction)
-    let mut def: HashMap<Value, (usize, usize)> = HashMap::new();
+    let mut def: HashMap<Value, (usize, usize)> = HashMap::default();
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             for &(_, v) in &inst.writes {
@@ -1268,7 +1269,7 @@ fn lds_flag_region(p: &Program, st: &Structured, blocks: &[usize]) -> bool {
             if !is_read {
                 continue;
             }
-            let mut seen: HashSet<usize> = HashSet::new();
+            let mut seen: HashSet<usize> = HashSet::default();
             let mut work: Vec<usize> = succ(rb).into_iter().filter(|t| inside.contains(t)).collect();
             while let Some(b) = work.pop() {
                 if seen.insert(b) {
@@ -1346,11 +1347,11 @@ fn lds_flag_region(p: &Program, st: &Structured, blocks: &[usize]) -> bool {
         };
         (reads, kills)
     };
-    let mut live_in: Vec<HashSet<Reg>> = vec![HashSet::new(); n];
+    let mut live_in: Vec<HashSet<Reg>> = vec![HashSet::default(); n];
     loop {
         let mut changed = false;
         for b in (0..n).rev() {
-            let mut live: HashSet<Reg> = HashSet::new();
+            let mut live: HashSet<Reg> = HashSet::default();
             for t in succ(b).unwrap_or_default() {
                 if let Some(l) = live_in.get(t) {
                     live.extend(l.iter().copied());
@@ -1410,7 +1411,7 @@ fn lane_constant_masks(st: &Structured) -> bool {
     // the lane's own bit of it.
     // shortcut: masks only selects read (`v_cndmask_b32`, carries in) are not followed; such
     // a program still stops with "a constant lane mask" or "an opaque lane mask".
-    let (mut seen, mut joins) = (HashSet::new(), HashSet::new());
+    let (mut seen, mut joins) = (HashSet::default(), HashSet::default());
     while let Some(g) = work.pop() {
         if !seen.insert(g) {
             continue;
@@ -1807,7 +1808,7 @@ fn half_outputs(io: &StageIo, outputs: &[SigElement]) -> HashMap<u8, (bool, Opti
     let entries = match io {
         StageIo::Vs { outputs, .. } => outputs,
         StageIo::Ms(ms) => &ms.outputs,
-        _ => return HashMap::new(),
+        _ => return HashMap::default(),
     };
     let per_vertex = || entries.iter().filter(|o| o.param & 0x80 == 0);
     let mut free: Vec<u8> = outputs
@@ -1842,7 +1843,7 @@ fn half_input_partners(io: &StageIo, inputs: &[SigElement]) -> HashMap<u8, u8> {
         inputs: entries, ..
     } = io
     else {
-        return HashMap::new();
+        return HashMap::default();
     };
     let packed = || entries.iter().filter(|i| i.fp16 && i.pack2);
     let mut free: Vec<u8> = inputs
@@ -1856,7 +1857,7 @@ fn half_input_partners(io: &StageIo, inputs: &[SigElement]) -> HashMap<u8, u8> {
     free.dedup();
     let mut missing: Vec<_> = packed().filter(|i| i.row2 == i.row).collect();
     missing.sort_by_key(|i| i.row);
-    let mut partners = HashMap::new();
+    let mut partners = HashMap::default();
     for i in missing {
         if let Some(k) = free.iter().position(|&r| r > i.row) {
             partners.insert(i.row, free.remove(k));
@@ -1872,7 +1873,7 @@ fn unsupported(offset: usize, what: Why) -> Stop {
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
         let p = x.p;
-        let mut phi_at = HashMap::new();
+        let mut phi_at = HashMap::default();
         for (b, block) in p.blocks.iter().enumerate() {
             for (i, phi) in block.phis.iter().enumerate() {
                 phi_at.insert(phi.value, (b, i));
@@ -2065,9 +2066,9 @@ impl<'a> Lower<'a> {
                 })
                 .collect()
         } else {
-            HashSet::new()
+            HashSet::default()
         };
-        let mut no_barrier = HashSet::new();
+        let mut no_barrier = HashSet::default();
         if let StageIo::Ms(ms) = &x.native.io {
             s.prims = x.prims.clone();
             s.threads = Some([ms.threads, 1, 1]);
@@ -2116,26 +2117,26 @@ impl<'a> Lower<'a> {
             s,
             x,
             bad,
-            lane_fail: HashMap::new(),
-            vals: HashMap::new(),
-            floats: HashMap::new(),
+            lane_fail: HashMap::default(),
+            vals: HashMap::default(),
+            floats: HashMap::default(),
             block: vec![None; p.blocks.len()],
             cur: 0,
-            bools: HashMap::new(),
-            lane_bits: HashMap::new(),
+            bools: HashMap::default(),
+            lane_bits: HashMap::default(),
             phi_at,
-            mask_phis: HashMap::new(),
+            mask_phis: HashMap::default(),
             pending_masks: Vec::new(),
             data_phis: Vec::new(),
-            read_phis: HashSet::new(),
-            stale: HashSet::new(),
-            coherent: HashSet::new(),
+            read_phis: HashSet::default(),
+            stale: HashSet::default(),
+            coherent: HashSet::default(),
             root_copy: None,
             page_there: None,
             ordered: if x.native.stage == HwStage::Ps {
                 ordered_section(p)
             } else {
-                HashSet::new()
+                HashSet::default()
             },
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
@@ -2168,9 +2169,9 @@ impl<'a> Lower<'a> {
                 }
                 m
             },
-            handles: HashMap::new(),
-            strides: HashMap::new(),
-            edges: HashMap::new(),
+            handles: HashMap::default(),
+            strides: HashMap::default(),
+            edges: HashMap::default(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
@@ -2185,7 +2186,7 @@ impl<'a> Lower<'a> {
             local_any: LOCAL_ANY.get(),
             uniform: match &exchange {
                 Some((_, false, all)) if !LOCAL_WAVES.get() => lane_uniform(p, x.st, all, wave_tid(p, x)),
-                _ => HashSet::new(),
+                _ => HashSet::default(),
             },
             own_bits: match &exchange {
                 Some((_, false, _)) if !LOCAL_WAVES.get() && own_bits_on() => {
@@ -2209,8 +2210,8 @@ impl<'a> Lower<'a> {
                 _ => MaskData::None,
             },
             mask_ok: false,
-            ballots: HashMap::new(),
-            balloting: HashSet::new(),
+            ballots: HashMap::default(),
+            balloting: HashSet::default(),
             def_block: p
                 .blocks
                 .iter()
@@ -2224,10 +2225,10 @@ impl<'a> Lower<'a> {
                 })
                 .collect(),
             cur_ir: 0,
-            sections: HashMap::new(),
-            section_out: HashSet::new(),
+            sections: HashMap::default(),
+            section_out: HashSet::default(),
             code_table: None,
-            counters: HashMap::new(),
+            counters: HashMap::default(),
             abort: None,
         }
     }
@@ -2399,7 +2400,7 @@ impl<'a> Lower<'a> {
     /// Finds the whole-wave sections and the values they leave.
     fn find_sections(&mut self) {
         let p = self.x.p;
-        let mut inside: HashMap<Value, (usize, usize, usize)> = HashMap::new();
+        let mut inside: HashMap<Value, (usize, usize, usize)> = HashMap::default();
         for b in 0..p.blocks.len() {
             let found = super::wave::sections(p, b);
             for (&start, sec) in &found {
@@ -6958,7 +6959,7 @@ impl<'a> Lower<'a> {
             }
             _ => None,
         };
-        let mut rows: HashMap<u32, V> = HashMap::new();
+        let mut rows: HashMap<u32, V> = HashMap::default();
         for k in 0..count {
             let x = match constant {
                 Some(base) => {
