@@ -1712,13 +1712,9 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
                     // (which holds the copy's bytes at the copy's offsets);
                     // nothing writes either while a submission's results
                     // are compared.
-                    let (now, old) = unsafe {
-                        (
-                            std::slice::from_raw_parts((data + at) as *const u8, n),
-                            std::slice::from_raw_parts((before + at) as *const u8, n),
-                        )
-                    };
-                    if now != old {
+                    // Not `!=`: that is the C runtime's memcmp, a scalar
+                    // loop under Wine (3 % of the process's time there).
+                    if unsafe { crate::safecopy::differ((data + at) as *const u8, (before + at) as *const u8, n) } {
                         pieces.push((at, n));
                     }
                     at += n;

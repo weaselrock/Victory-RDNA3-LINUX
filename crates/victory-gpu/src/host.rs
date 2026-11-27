@@ -394,14 +394,38 @@ pub(crate) fn keep_freed() -> bool {
 /// Effective idle timeout (in milliseconds) for system-RAM caches (staging
 /// buffers, loose shadows, and the mapped pipeline library), scaled down
 /// when free physical RAM is low. Never returns less than 2,000 ms.
-/// With plenty of it five minutes ([`keep_freed`]).
+/// With plenty of it five minutes ([`keep_freed`]), unless this process
+/// is already near the PC's commit limit ([`near_commit_limit`]).
 pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
     // (`VICTORY_RESIDENCY=1`: the smaller of free RAM and free commit.)
     let effective = match (avail_phys, crate::residency::headroom()) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
     };
-    ram_idle_for(effective, keep_freed() && !crate::residency::limited_host_ram())
+    let keep = keep_freed() && !crate::residency::limited_host_ram() && !near_commit_limit();
+    ram_idle_for(effective, keep)
+}
+
+/// Whether this process's private bytes have reached 70 % of the smaller
+/// of the PC's RAM and its commit limit (RAM plus page files), the share
+/// of [`ram_band`]'s Watch mark. Free RAM alone does not show it: on a
+/// 32 GB PC the process grows to 35–43 GB of commit while 12 GB of RAM can
+/// still look free, and freed copies kept for five minutes then push it
+/// into the page file (#234, #146, #189). The commit limit alone does not
+/// either: with a 48 GB page file it is 80 GB, far past where paging
+/// starts. Past the mark the shorter idle times by free RAM apply. A
+/// failed query changes nothing.
+fn near_commit_limit() -> bool {
+    ram_sample().is_some_and(|(_, private, _, _, total, limit)| private_near_limit(private, total, limit))
+}
+
+fn private_near_limit(private: u64, total_physical: u64, commit_limit: u64) -> bool {
+    let room = match (total_physical, commit_limit) {
+        (0, 0) => return false,
+        (0, b) | (b, 0) => b,
+        (a, b) => a.min(b),
+    };
+    private.saturating_mul(10) >= room.saturating_mul(7)
 }
 
 fn ram_idle_for(avail_phys: Option<u64>, keep: bool) -> u64 {
@@ -8712,6 +8736,15 @@ fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, us
 }
 
 impl Host {
+    /// Whether the direct queue has actually reached its last submission.
+    /// A failed signal or wait can return to the caller before that happens.
+    pub(crate) fn submitted_work_complete(&self) -> bool {
+        let Ok(target) = self.submitted.try_lock() else { return false };
+        // SAFETY: a query of our live fence. Removal reports u64::MAX.
+        let completed = unsafe { self.fence.GetCompletedValue() };
+        completed != u64::MAX && completed >= *target
+    }
+
     /// The queue everything of ours runs on, for a call that must go to it
     /// in order with the lists (`crate::tiles`: a texture's levels are
     /// given memory ahead of the list that uploads them).
@@ -11088,6 +11121,29 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+
+    #[test]
+    fn freed_copies_not_kept_near_the_commit_limit() {
+        use super::private_near_limit;
+        let gib = 1u64 << 30;
+        // 70 % exactly of the smaller one is near, a byte under it is not.
+        assert!(private_near_limit(7 * gib, 10 * gib, 20 * gib));
+        assert!(!private_near_limit(7 * gib - 1, 10 * gib, 20 * gib));
+        assert!(private_near_limit(7 * gib, 20 * gib, 10 * gib));
+        // A 32 GB PC with a 48 GB page file (an 80 GB commit limit): RAM
+        // sets the mark, about 22.4 GB, not 56 GB.
+        assert!(!private_near_limit(20 * gib, 32 * gib, 80 * gib));
+        assert!(private_near_limit(23 * gib, 32 * gib, 80 * gib));
+        assert!(private_near_limit(40 * gib, 32 * gib, 80 * gib));
+        // A 64 GB PC at the README's 30 GB keeps its copies as before.
+        assert!(!private_near_limit(30 * gib, 64 * gib, 80 * gib));
+        // One unknown number: the other one; both unknown: never near.
+        assert!(private_near_limit(23 * gib, 0, 32 * gib));
+        assert!(private_near_limit(23 * gib, 32 * gib, 0));
+        assert!(!private_near_limit(u64::MAX, 0, 0));
+        // No overflow on huge values.
+        assert!(private_near_limit(u64::MAX, u64::MAX, u64::MAX));
     }
 }
 

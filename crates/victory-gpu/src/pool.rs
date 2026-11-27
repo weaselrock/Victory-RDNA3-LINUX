@@ -38,12 +38,31 @@ const STAGING_KEPT: usize = 8;
 /// How many are kept now.
 static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 
+/// `VICTORY_POOL_RECLAIM`: sweep empty 64 MiB texture blocks as soon as VRAM
+/// reaches 85 % of budget (even without `VICTORY_RESIDENCY=1`; `0`: as before;
+/// on by default).
+pub(crate) fn reclaim_on() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_POOL_RECLAIM") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_POOL_RECLAIM").is_none_or(|v| v != "0"))
+}
+
 /// Sets how many empty blocks stay, by the card's memory (budget and use):
 /// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
 /// Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
     if !crate::residency::on() {
-        SPARES.store(spares(memory, crate::host::keep_freed()), Ordering::Relaxed);
+        let limit = spares(memory, crate::host::keep_freed());
+        SPARES.store(limit, Ordering::Relaxed);
+        if reclaim_on()
+            && limit < SPARE_KEPT
+            && let Ok(mut pool) = TEXTURES.try_lock()
+        {
+            pool.reclaim(now(), limit, true);
+        }
         return;
     }
     // (`VICTORY_RESIDENCY=1`, codec-d/cool_fox c64fc9b4/e94d277a: fewer
@@ -1011,5 +1030,28 @@ mod tests {
             // SAFETY: plain query.
             assert!(host.device.GetDeviceRemovedReason().is_ok());
         }
+    }
+
+    #[test]
+    fn sweep_reclaims_empty_spares_without_new_allocations() {
+        let mut pool: Pool<u32> = Pool::new(SPARE_KEPT);
+        let mut pieces = Vec::new();
+        for n in 1u32..=5 {
+            let (piece, _, _) = pool.take(BLOCK / 2, 512, 0, || Some(n)).unwrap();
+            pieces.push(piece);
+            // Force a fresh block each time so 5 blocks exist.
+            let (other, _, _) = pool.take(BLOCK / 2, 512, 0, || unreachable!()).unwrap();
+            pool.give(other, 0);
+        }
+        pool.rested(REST + 1);
+        assert_eq!(pool.blocks(), 5);
+
+        // Return all pieces while `take` is no longer called (as when room is tight).
+        for piece in pieces {
+            pool.give(piece, 0);
+        }
+        // Dropping the limit below `SPARE_KEPT` and sweeping releases empty blocks down to `SPARE`.
+        pool.reclaim(REST + 1, SPARE, true);
+        assert_eq!(pool.blocks(), SPARE);
     }
 }
