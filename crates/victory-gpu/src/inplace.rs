@@ -137,8 +137,10 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     if level() < if window { 1 } else { 2 } {
         return None;
     }
-    // View memory: known from the runtime without asking Windows.
-    if cover(start as usize, len as usize) != Cover::None {
+    // View memory: known from the runtime without asking Windows. Memory
+    // of a placed region of port 1's is the card's own mapping, never
+    // opened from its address.
+    if cover(start as usize, len as usize) != Cover::None || crate::port::placed_touches(start, len) {
         STATS[4].fetch_add(1, Ordering::Relaxed);
         return None;
     }
@@ -261,9 +263,16 @@ fn buffer_desc(size: u64, flags: D3D12_RESOURCE_FLAGS) -> D3D12_RESOURCE_DESC {
 /// A buffer of `size` bytes at `offset` (a multiple of 64 KiB) of an
 /// opened heap, which shaders may read and write, in the common state.
 pub(crate) fn place(device: &ID3D12Device, heap: &ID3D12Heap, offset: u64, size: u64) -> windows::core::Result<ID3D12Resource> {
+    place_with(device, heap, offset, size, true)
+}
+
+/// [`place`] in a heap that is cross-adapter shared (`cross`: opened on
+/// memory the process has) or not (a heap of the card's own,
+/// `crate::port_placed`).
+pub(crate) fn place_with(device: &ID3D12Device, heap: &ID3D12Heap, offset: u64, size: u64, cross: bool) -> windows::core::Result<ID3D12Resource> {
     let mut placed: Option<ID3D12Resource> = None;
-    // The heap is cross-adapter shared, so the buffer must say so too.
-    let flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    // A cross-adapter shared heap's buffer must say so too.
+    let flags = if cross { D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER } else { D3D12_RESOURCE_FLAG_NONE } | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     // SAFETY: plain creation in a live heap.
     unsafe { device.CreatePlacedResource(heap, offset, &buffer_desc(size, flags), D3D12_RESOURCE_STATE_COMMON, None, &mut placed)? };
     placed.ok_or_else(windows::core::Error::empty)

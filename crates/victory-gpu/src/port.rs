@@ -78,11 +78,15 @@ pub(crate) fn on() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_PORT_CONSTANTS").is_ok_and(|v| v.trim() == "1"))
 }
 
-/// A stretch of title memory opened as a heap through a view of ours.
+/// A stretch of title memory opened as a heap through a view of ours, or
+/// (`crate::port_placed`) a heap of the card's mapped at the title's address.
 struct Region {
     start: u64,
     end: u64,
     heap: ID3D12Heap,
+    /// Placed: vkd3d's `VkDevice` and the heap's `VkDeviceMemory`, for
+    /// letting the mapping go ([`take_placed`]).
+    placed: Option<(u64, u64)>,
 }
 
 // SAFETY: D3D12 heaps are free-threaded.
@@ -161,7 +165,10 @@ pub(crate) fn place_in(device: &ID3D12Device, start: u64, len: u64) -> Result<Pl
         }
     };
     let region = &regions[i];
-    let buffer = crate::inplace::place(device, &region.heap, at - region.start, end - at).map_err(|e| (6, format!("no buffer placed in the region: {e}")))?;
+    // A heap of the card's own is not cross-adapter shared: its buffers do
+    // not say so.
+    let buffer = crate::inplace::place_with(device, &region.heap, at - region.start, end - at, region.placed.is_none())
+        .map_err(|e| (6, format!("no buffer placed in the region: {e}")))?;
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
     Ok(Placed { buffer, heap: region.heap.clone(), gpu, bias: start - at })
@@ -216,7 +223,7 @@ fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usiz
             );
             // shortcut: the view stays mapped for good (the heap holds its
             // pages while anything names it).
-            Ok(Region { start: first, end: first + bytes, heap })
+            Ok(Region { start: first, end: first + bytes, heap, placed: None })
         }
         Err(e) => {
             unmap();
@@ -256,9 +263,63 @@ pub(crate) fn forget(at: usize, len: usize) {
     }
     let mut regions = REGIONS.lock().unwrap_or_else(|e| e.into_inner());
     let before = regions.len();
-    regions.retain(|r| r.end <= at || r.start >= end);
+    // A placed region stays: its heap is the title's memory itself, mapped
+    // where the title has it, and only `xmem` may let it go
+    // ([`take_placed`]), giving the addresses back to the process.
+    regions.retain(|r| {
+        let keep = r.end <= at || r.start >= end || r.placed.is_some();
+        if keep && r.placed.is_some() && r.end > at && r.start < end {
+            crate::port_placed::kept();
+        }
+        keep
+    });
     STATS[7].fetch_add((before - regions.len()) as u64, Ordering::Relaxed);
     bounds(&regions);
+}
+
+/// A heap of the card's mapped at `[start, start + bytes)` (the title's
+/// address) is the region there ([`crate::port_placed::register`]).
+pub(crate) fn add_placed(start: u64, bytes: u64, heap: ID3D12Heap, device: u64, memory: u64) {
+    let mut regions = REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+    let end = start + bytes;
+    regions.retain(|r| r.end <= start || r.start >= end);
+    regions.push(Region { start, end, heap, placed: Some((device, memory)) });
+    STATS[0].fetch_add(1, Ordering::Relaxed);
+    STATS[1].fetch_add(bytes, Ordering::Relaxed);
+    bounds(&regions);
+}
+
+/// The placed regions over `[at, at + len)`, taken out: start, end, heap,
+/// `VkDevice`, `VkDeviceMemory` ([`crate::port_placed::release`]).
+pub(crate) fn take_placed(at: u64, len: u64) -> Vec<(u64, u64, ID3D12Heap, u64, u64)> {
+    let end = at.saturating_add(len.max(1));
+    let mut regions = REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < regions.len() {
+        let r = &regions[i];
+        if let Some((device, memory)) = r.placed
+            && r.end > at
+            && r.start < end
+        {
+            let r = regions.swap_remove(i);
+            out.push((r.start, r.end, r.heap, device, memory));
+        } else {
+            i += 1;
+        }
+    }
+    bounds(&regions);
+    out
+}
+
+/// Whether `[at, at + len)` touches a placed region
+/// ([`crate::port_placed`]).
+pub(crate) fn placed_touches(at: u64, len: u64) -> bool {
+    if !crate::port_placed::on() || !touches(at as usize, len as usize) {
+        return false;
+    }
+    let end = at.saturating_add(len.max(1));
+    REGIONS.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|r| r.placed.is_some() && r.start < end && at < r.end)
 }
 
 /// Whether `[at, at + len)` touches ported memory (a quick look).
@@ -309,6 +370,7 @@ pub(crate) fn log(frames: f64) {
         s[6],
         s[7],
     );
+    crate::port_placed::log();
 }
 
 #[cfg(test)]

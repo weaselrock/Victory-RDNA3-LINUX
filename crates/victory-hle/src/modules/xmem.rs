@@ -393,6 +393,10 @@ struct Section {
     window: std::sync::OnceLock<usize>,
     /// A bit per page: committed, as far as [`Section::window`] asked.
     committed: Box<[std::sync::atomic::AtomicU64]>,
+    /// Renderer port 1 placed ([`place_reservation`]): the address where
+    /// page 0 of the section is the card's memory mapped at the title's
+    /// address (0: none). Writes to the pages go there, not to the section.
+    placed: AtomicUsize,
 }
 
 impl Section {
@@ -411,7 +415,18 @@ impl Section {
         use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
         static ON: LazyLock<bool> =
             LazyLock::new(|| std::env::var_os("VICTORY_SECTION_WINDOW").is_none_or(|v| v != "0"));
-        if !*ON || index + n > self.pages {
+        if index + n > self.pages {
+            return None;
+        }
+        // The pages are the card's memory at the title's address now: what
+        // is written to them goes there.
+        let placed = self.placed.load(Ordering::Acquire);
+        if placed != 0 {
+            // Written: not fresh for `arrange` any more, as when committed.
+            self.mark(index, n);
+            return Some(placed + index * PAGE);
+        }
+        if !*ON {
             return None;
         }
         let base = *self.window.get_or_init(|| {
@@ -445,6 +460,15 @@ impl Section {
 }
 
 impl Section {
+    /// Notes `n` pages from `index` on as committed (in use: [`arrange`]
+    /// gives only pages without the bit another place).
+    fn mark(&self, index: usize, n: usize) {
+        use std::sync::atomic::Ordering;
+        for p in index..(index + n).min(self.pages) {
+            self.committed[p / 64].fetch_or(1 << (p % 64), Ordering::AcqRel);
+        }
+    }
+
     /// Commits the pages from `index` on that a view at `base` shows, unless
     /// all of them are ([`lean`]): committed for one view is for all.
     fn commit_shown(&self, index: usize, base: usize, len: usize) -> bool {
@@ -510,6 +534,27 @@ struct Physical {
     /// Placeholders that are some view's own, left by its unmapping: address
     /// and length. The title may have joined one with others since.
     holes: HashMap<usize, usize>,
+    /// Renderer port 1 placed ([`place_reservation`]): reservations backed
+    /// by the card's memory mapped at the title's address.
+    placed: Vec<PlacedRun>,
+    /// Reservations placing was tried for (by base): once each.
+    tried: Vec<usize>,
+}
+
+/// A reservation that is the card's memory, mapped at its address
+/// (`victory_gpu::port_placed`): the title's mapping calls in it are
+/// bookkeeping only, while they map each page of `section` at its offset.
+struct PlacedRun {
+    base: usize,
+    len: usize,
+    /// Its pages, in order from page 0: the reservation's own.
+    section: Arc<Section>,
+    /// What the title has mapped there: address -> bytes and first slice
+    /// (also noted in [`SHOWN`]). No view of ours is behind them.
+    views: BTreeMap<usize, (usize, Slice)>,
+    /// The placeholders committed read-write under the GPU mapping:
+    /// address, bytes.
+    allocations: Vec<(usize, usize)>,
 }
 
 impl Physical {
@@ -684,6 +729,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         pages: n,
         window: std::sync::OnceLock::new(),
         committed: (0..n.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
+        placed: AtomicUsize::new(0),
     });
     let mut table = page_table_mut();
     let first = table.next_page;
@@ -1179,6 +1225,418 @@ fn arrange(base: usize, pages: &[usize]) {
     }
 }
 
+/// Renderer port 1 placed (`VICTORY_PORT_PLACED=1` with
+/// `VICTORY_PORT_CONSTANTS=1`): the title's 32-bit graphics reservation is
+/// the card's memory mapped at its address (`victory_gpu::port_placed`), not
+/// section views; the title's mapping calls in it are bookkeeping only.
+fn placed_on() -> bool {
+    port_on() && victory_gpu::port_placed::on()
+}
+
+/// Whether a reservation is placed now (a quick look for `VirtualFree`).
+static PLACED_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The 32-bit graphics reservation ([`LOW_RESERVATIONS`]) that holds
+/// `[base, base + len)`: base and bytes.
+fn low_reservation(base: usize, len: usize) -> Option<(usize, usize)> {
+    LOW_RESERVATIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .copied()
+        .find(|&(at, size)| at <= base && base.saturating_add(len) <= at + size)
+}
+
+impl Physical {
+    /// The placed run `[at, at + len)` touches.
+    fn placed_touching(&self, at: usize, len: usize) -> Option<usize> {
+        let end = at.saturating_add(len.max(1));
+        self.placed.iter().position(|r| r.base < end && at < r.base + r.len)
+    }
+}
+
+/// Whether `slices`, mapped at `at`, are each `section`'s page at its offset
+/// from `base` (the page `base` shows is page 0), all inside `base + len`.
+fn own_pages(base: usize, len: usize, section: &Arc<Section>, at: usize, slices: &[Option<Slice>]) -> bool {
+    at >= base
+        && at.is_multiple_of(PAGE)
+        && at + slices.len() * PAGE <= base + len
+        && slices.iter().enumerate().all(|(i, s)| {
+            s.as_ref().is_some_and(|s| Arc::ptr_eq(&s.section, section) && s.index == (at - base) / PAGE + i)
+        })
+}
+
+/// Bookkeeping of a mapping call in a placed run: what the title had mapped
+/// over `[at, at + len)` is forgotten and `slice` on is noted there (`None`:
+/// unmapped). Nothing is mapped or unmapped: the bytes there are those
+/// pages' already, and stay.
+fn placed_note(run: &mut PlacedRun, at: usize, len: usize, slice: Option<Slice>) {
+    let end = at + len;
+    let first = run.views.range(..=at).next_back().filter(|(b, v)| **b + v.0 > at).map(|(b, _)| *b);
+    let hit: Vec<usize> = first.into_iter().chain(run.views.range(at + 1..end.max(at + 1)).map(|(b, _)| *b)).collect();
+    let mut shown = shown_mut();
+    for b in hit {
+        let Some((size, s)) = run.views.remove(&b) else {
+            continue;
+        };
+        shown.forget(b, size, &s);
+        if b < at {
+            shown.note(b, at - b, &s);
+            run.views.insert(b, (at - b, s.clone()));
+        }
+        if b + size > end {
+            let rest = Slice { index: s.index + (end - b) / PAGE, section: s.section.clone() };
+            shown.note(end, b + size - end, &rest);
+            run.views.insert(end, (b + size - end, rest));
+        }
+    }
+    if let Some(slice) = slice
+        && len > 0
+    {
+        // Shown: in use, as `commit_shown` notes a view's pages.
+        slice.section.mark(slice.index, len / PAGE);
+        shown.note(at, len, &slice);
+        run.views.insert(at, (len, slice));
+    }
+}
+
+/// Copies `n` pages of `section` from page `index` between the section's
+/// own bytes and the memory at `at`: into `at` (`into_at`) or from it.
+/// Call with the section's redirect ([`Section::placed`]) off.
+fn section_copy(section: &Arc<Section>, index: usize, n: usize, at: usize, into_at: bool) -> bool {
+    if section.placed.load(Ordering::Acquire) != 0 {
+        return false;
+    }
+    let mut own = None;
+    let bytes = match section.window(index, n) {
+        Some(p) => p,
+        None => match View::map(&Slice { section: section.clone(), index }, n) {
+            Some(view) => {
+                let p = view.at.Value as usize;
+                own = Some(view);
+                p
+            }
+            None => return false,
+        },
+    };
+    let (from, to) = if into_at { (bytes, at) } else { (at, bytes) };
+    // SAFETY: two mappings of `n` committed read-write pages each (the
+    // section's bytes, and the card's memory at the title's address).
+    unsafe { std::ptr::copy_nonoverlapping(from as *const u8, to as *mut u8, n * PAGE) };
+    drop(own);
+    true
+}
+
+/// The placeholders committed for a placed run, given back as placeholders.
+fn give_back(allocations: &[(usize, usize)]) {
+    for &(at, size) in allocations {
+        // SAFETY: memory we committed in place of a placeholder.
+        if unsafe { VirtualFree(at as *mut c_void, size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) } == 0 {
+            tracing::warn!(
+                at = format_args!("{at:#x}"),
+                size,
+                error = %std::io::Error::last_os_error(),
+                "renderer port 1 placed: memory not given back as a placeholder"
+            );
+        }
+    }
+}
+
+/// The title's views of a reservation [`place_reservation`] took away,
+/// mapped again after a failure; the first `unmapped` of them had been.
+fn reshow(views: &[(usize, usize, Slice)], unmapped: usize) {
+    for (k, (at, size, slice)) in views.iter().enumerate() {
+        if k < unmapped && !show(*at, *size, slice, true) {
+            tracing::warn!(at = format_args!("{at:#x}"), size, "renderer port 1 placed: a view of the title's not mapped again");
+            continue;
+        }
+        victory_gpu::title_memory_remapped(*at, *size);
+        victory_gpu::title_memory_view(*at, *size, slice.section.handle as usize, (slice.index * PAGE) as u64);
+    }
+}
+
+/// Backs the 32-bit graphics reservation `(first, bytes)`, whose pages are
+/// all of `section` in order (page 0 at `first`: what [`arrange`] gives),
+/// with the card's memory mapped at `first`:
+///
+/// 1. no page of the section may be shown anywhere but at its own offset in
+///    the reservation (the title's views never alias a page twice), and the
+///    views in the reservation must be of those pages: else nothing is done;
+/// 2. a heap of `bytes` (`victory_gpu::port_placed::prepare`);
+/// 3. the title's views in the reservation unmapped (their bytes stay in the
+///    section), every placeholder of it committed read-write;
+/// 4. the heap mapped over it (`vkMapMemory2`, placed);
+/// 5. the bytes the section's pages hold (any that were ever mapped or
+///    written) copied in;
+/// 6. writes to the pages sent there from then on ([`Section::placed`]), the
+///    views kept as bookkeeping, and port 1 given the heap as its region.
+///
+/// Any failure puts back what was there and says why; port 1 then works
+/// as before. With [`PHYSICAL`] and the change of mapping held.
+fn place_reservation(physical: &mut Physical, (first, bytes): (usize, usize), section: &Arc<Section>) -> Result<(), String> {
+    let end = first + bytes;
+    if section.pages * PAGE != bytes || !first.is_multiple_of(PAGE) {
+        return Err(format!(
+            "the reservation {first:#x}+{bytes:#x} is not one section of its size ({} pages)",
+            section.pages
+        ));
+    }
+    // 1. Aliases: each page of the section shown only at its own offset.
+    {
+        let shown = SHOWN.read().unwrap_or_else(|e| e.into_inner());
+        for index in 0..section.pages {
+            let own = first + index * PAGE;
+            if let Some((at, _)) = shown.at(&Slice { section: section.clone(), index }).into_iter().find(|&(at, _)| at != own) {
+                return Err(format!(
+                    "page {index} of its section is shown at {at:#x} too, not only at {own:#x} (aliased): the whole region falls back"
+                ));
+            }
+        }
+    }
+    if let Some((&at, (size, _))) = physical.views.range(..first).next_back()
+        && at + size > first
+    {
+        return Err(format!("a view at {at:#x}+{size:#x} reaches into it"));
+    }
+    let views: Vec<(usize, usize, Slice)> =
+        physical.views.range(first..end).map(|(&at, (size, slice))| (at, *size, slice.clone())).collect();
+    for (at, size, slice) in &views {
+        if at + size > end {
+            return Err(format!("a view at {at:#x}+{size:#x} reaches out of it"));
+        }
+        if !Arc::ptr_eq(&slice.section, section) || slice.index != (at - first) / PAGE {
+            return Err(format!("the view at {at:#x} shows other pages than its own"));
+        }
+    }
+    // 2. The heap.
+    let prepared = victory_gpu::port_placed::prepare(bytes)?;
+    // 3. The title's views go (the bytes stay in the section's pages).
+    for (at, size, _) in &views {
+        victory_gpu::title_memory_unmapping(*at, *size);
+    }
+    for (k, (at, _, _)) in views.iter().enumerate() {
+        // SAFETY: a view we mapped; it becomes a placeholder again.
+        let gone = unsafe {
+            UnmapViewOfFile2(GetCurrentProcess(), MEMORY_MAPPED_VIEW_ADDRESS { Value: *at as *mut c_void }, MEM_PRESERVE_PLACEHOLDER)
+        } != 0;
+        if !gone {
+            let error = std::io::Error::last_os_error();
+            reshow(&views, k);
+            return Err(format!("the title's view at {at:#x} not unmapped: {error}"));
+        }
+    }
+    // Every placeholder of the reservation (the title split it in pieces).
+    let mut pieces: Vec<(usize, usize)> = Vec::new();
+    let mut here = first;
+    while here < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let asked = unsafe { VirtualQueryEx(GetCurrentProcess(), here as *const c_void, &mut info, size_of_val(&info)) };
+        if asked == 0 || info.State != MEM_RESERVE || info.AllocationBase as usize != here || info.RegionSize == 0 {
+            reshow(&views, views.len());
+            return Err(format!(
+                "{here:#x} is not the start of a placeholder (state {:#x}, allocation {:p})",
+                info.State, info.AllocationBase
+            ));
+        }
+        let stop = (here + info.RegionSize).min(end);
+        pieces.push((here, stop - here));
+        here = stop;
+    }
+    let mut committed: Vec<(usize, usize)> = Vec::new();
+    for &(at, size) in &pieces {
+        // SAFETY: a placeholder of the title's reservation, made committed
+        // read-write memory in its place.
+        let got = unsafe {
+            VirtualAlloc2(
+                GetCurrentProcess(),
+                at as *const c_void,
+                size,
+                MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if got as usize != at {
+            let error = std::io::Error::last_os_error();
+            give_back(&committed);
+            reshow(&views, views.len());
+            return Err(format!("the placeholder {at:#x}+{size:#x} not committed: {error}"));
+        }
+        committed.push((at, size));
+    }
+    // 4. The card's memory over it.
+    if let Err(why) = victory_gpu::port_placed::map(&prepared, first) {
+        give_back(&committed);
+        reshow(&views, views.len());
+        return Err(why);
+    }
+    // 5. What the pages hold, kept: copied in.
+    let bit = |p: usize| section.committed[p / 64].load(Ordering::Acquire) >> (p % 64) & 1 != 0;
+    let (mut p, mut copied) = (0, 0);
+    while p < section.pages {
+        if !bit(p) {
+            p += 1;
+            continue;
+        }
+        let n = (p..section.pages).take_while(|&q| bit(q)).count();
+        if !section_copy(section, p, n, first + p * PAGE, true) {
+            victory_gpu::port_placed::unmap(&prepared);
+            give_back(&committed);
+            reshow(&views, views.len());
+            return Err(format!("pages {p}..{} not copied in", p + n));
+        }
+        copied += n;
+        p += n;
+    }
+    // 6. From now on.
+    section.placed.store(first, Ordering::Release);
+    let mut kept = BTreeMap::new();
+    for (at, size, slice) in views {
+        physical.views.remove(&at);
+        kept.insert(at, (size, slice));
+    }
+    physical.holes.retain(|&at, _| at < first || at >= end);
+    let n_views = kept.len();
+    physical.placed.push(PlacedRun { base: first, len: bytes, section: section.clone(), views: kept, allocations: committed });
+    PLACED_ANY.store(true, Ordering::Relaxed);
+    // What the GPU side knew of the memory there goes (port 1's region
+    // opened on views of it among it), then the heap is port 1's region.
+    victory_gpu::title_memory_remapped(first, bytes);
+    victory_gpu::port_placed::register(prepared, first);
+    tracing::info!(
+        at = format_args!("{first:#x}"),
+        bytes,
+        placeholders = pieces.len(),
+        views = n_views,
+        pages_copied = copied,
+        "renderer port 1 placed: the 32-bit graphics reservation's mapping calls are bookkeeping only from now on"
+    );
+    Ok(())
+}
+
+/// The placed runs `[at, at + len)` touches are let go, because `why`: their
+/// bytes copied back into their section's pages, the GPU mapping let go
+/// (`victory_gpu::port_placed::release`), the memory given back as
+/// placeholders and the title's views of it mapped again as section views,
+/// as they were before placing. With [`PHYSICAL`] and the change of mapping
+/// held.
+fn unplace(physical: &mut Physical, at: usize, len: usize, why: &str) {
+    while let Some(i) = physical.placed_touching(at, len) {
+        let run = physical.placed.swap_remove(i);
+        let section = run.section.clone();
+        section.placed.store(0, Ordering::Release);
+        let copied = section_copy(&section, 0, section.pages, run.base, false);
+        victory_gpu::title_memory_unmapping(run.base, run.len);
+        victory_gpu::port_placed::release(run.base, run.len);
+        give_back(&run.allocations);
+        for &(a, size) in &run.allocations {
+            physical.holes.insert(a, size);
+        }
+        {
+            let mut shown = shown_mut();
+            for (&a, (size, slice)) in &run.views {
+                shown.forget(a, *size, slice);
+            }
+        }
+        let (mut shown, all) = (0, run.views.len());
+        for (a, (size, slice)) in run.views {
+            if !run.allocations.contains(&(a, size)) {
+                physical.holes.remove(&a);
+            }
+            shown += usize::from(map(physical, a, size, slice));
+        }
+        tracing::warn!(
+            at = format_args!("{:#x}", run.base),
+            bytes = run.len,
+            why,
+            bytes_kept = copied,
+            views_mapped_again = shown,
+            views = all,
+            "renderer port 1 placed: the reservation's placed GPU mapping let go, section views as before"
+        );
+    }
+    PLACED_ANY.store(!physical.placed.is_empty(), Ordering::Relaxed);
+}
+
+/// Placed runs whose section's pages are among `slices` are let go: pages
+/// of them mapped anywhere else would alias the card's memory.
+fn unplace_aliased<'a>(physical: &mut Physical, slices: impl Iterator<Item = &'a Slice> + Clone) {
+    while let Some((b, l)) = slices
+        .clone()
+        .find_map(|s| physical.placed.iter().find(|r| Arc::ptr_eq(&r.section, &s.section)).map(|r| (r.base, r.len)))
+    {
+        unplace(physical, b, l, "a page of it mapped elsewhere too (aliased)");
+    }
+}
+
+/// Renderer port 1 placed: the title maps `n` pages at `base` (`pages`
+/// `None`: unmaps), with [`PHYSICAL`] and the change of mapping held. True
+/// if done here: bookkeeping in a placed run, or the reservation
+/// (`reservation`, tried once) placed with this call. False: the caller
+/// maps as before (a placed run in the way was let go).
+fn placed_call(physical: &mut Physical, base: usize, n: usize, pages: Option<&[usize]>, reservation: Option<(usize, usize)>) -> bool {
+    let len = n * PAGE;
+    let slices: Option<Vec<Option<Slice>>> = pages.map(|pages| {
+        let table = page_table();
+        pages.iter().map(|page| table.pages.get(page).cloned()).collect()
+    });
+    if let Some(i) = physical.placed.iter().position(|r| r.base <= base && base + len <= r.base + r.len) {
+        let run = &mut physical.placed[i];
+        match &slices {
+            None => {
+                placed_note(run, base, len, None);
+                return true;
+            }
+            Some(s) if own_pages(run.base, run.len, &run.section, base, s) => {
+                let first = s.first().cloned().flatten();
+                placed_note(run, base, len, first);
+                return true;
+            }
+            Some(_) => {
+                unplace(physical, base, len, "other pages mapped into it");
+                return false;
+            }
+        }
+    }
+    if let Some(s) = &slices
+        && !physical.placed.is_empty()
+    {
+        unplace_aliased(physical, s.iter().flatten());
+    }
+    let (Some(reservation), Some(s)) = (reservation, &slices) else {
+        return false;
+    };
+    let Some(Some(first)) = s.first() else {
+        return false;
+    };
+    if physical.tried.contains(&reservation.0) {
+        return false;
+    }
+    physical.tried.push(reservation.0);
+    let section = first.section.clone();
+    if !own_pages(reservation.0, reservation.1, &section, base, s) {
+        victory_gpu::port_placed::fallback(&format!(
+            "the first pages mapped into the reservation at {:#x} are not its section's at their offsets",
+            reservation.0
+        ));
+        return false;
+    }
+    match place_reservation(physical, reservation, &section) {
+        Ok(()) => {
+            let i = physical.placed.len() - 1;
+            placed_note(&mut physical.placed[i], base, len, Some(first.clone()));
+            true
+        }
+        Err(why) => {
+            victory_gpu::port_placed::fallback(&why);
+            false
+        }
+    }
+}
+
 /// Maps `n` pages at `address`, in place of what is mapped there; null
 /// `pages` unmaps. Returns `address`, or null if a page or the host fails.
 pub extern "system" fn XMemMapPhysicalPages(
@@ -1196,6 +1654,12 @@ pub extern "system" fn XMemMapPhysicalPages(
     {
         arrange(base, pages);
     }
+    // Renderer port 1 placed: the reservation this maps into, and the host
+    // device made before the locks are taken.
+    let reservation = if placed_on() && pages.is_some() { low_reservation(base, n * PAGE) } else { None };
+    if reservation.is_some() {
+        victory_gpu::port_placed::warm();
+    }
     let mut costed = Costed::begin(Some(n));
     let _called = victory_gpu::timeline::span("the title's XMemMapPhysicalPages");
     let _busy = Busy::begin();
@@ -1208,6 +1672,11 @@ pub extern "system" fn XMemMapPhysicalPages(
     // until it is committed. A read of title memory in place must not fall
     // into that gap (`victory_gpu::title_memory_remapping`).
     let _changing = victory_gpu::title_memory_remapping();
+    if (reservation.is_some() || !physical.placed.is_empty())
+        && placed_call(&mut physical, base, n, pages.as_deref(), reservation)
+    {
+        return address;
+    }
     unmap(&mut physical, base, n * PAGE);
     let Some(pages) = pages else {
         return address;
@@ -1292,6 +1761,11 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let mut physical = physical();
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
     let _changing = victory_gpu::title_memory_remapping();
+    // Renderer port 1 placed: its pages mapped elsewhere too would show the
+    // section's bytes, not the card's.
+    if from != 0 && !physical.placed.is_empty() {
+        unplace(&mut physical, from, len, "its pages copied into another mapping");
+    }
     unmap(&mut physical, to, len);
     for k in (0..len).step_by(PAGE) {
         if from == 0 {
@@ -1337,6 +1811,13 @@ pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
             // from: after it.
             if ops.len() == GROUP || touched.contains(&to) || from.is_some_and(|from| touched.contains(&from)) {
                 break;
+            }
+            if let Some(from) = from
+                && !physical.placed.is_empty()
+            {
+                // Renderer port 1 placed, as in `map_alias`.
+                let _changing = victory_gpu::title_memory_remapping();
+                unplace(&mut physical, from, PAGE, "its pages copied into another mapping");
             }
             let slice = from.map(|from| physical.slice_at(from));
             ok &= !matches!(slice, Some(None));
@@ -1528,6 +2009,14 @@ impl Op {
 /// With [`PHYSICAL`] and the change of mapping (`title_memory_remapping`)
 /// held.
 fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
+    // Renderer port 1 placed: a page mapped over a placed run, or one of its
+    // pages mapped elsewhere, lets it go.
+    if !physical.placed.is_empty() {
+        for op in &ops {
+            unplace(physical, op.at, PAGE, "a page mapped over it");
+        }
+        unplace_aliased(physical, ops.iter().filter_map(|op| op.slice.as_ref()));
+    }
     for op in &mut ops {
         let there = physical
             .views
@@ -1844,6 +2333,10 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
     if len == 0 {
         return;
     }
+    // Renderer port 1 placed: memory mapped over a placed run lets it go.
+    if !physical.placed.is_empty() {
+        unplace(physical, base, len, "other memory mapped over it");
+    }
     let end = base + len;
     // Views do not overlap: the one holding `base`, then those starting
     // inside (the GPU's page mappings make one view per page).
@@ -1980,6 +2473,23 @@ pub extern "system" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
 /// first: the address may be other memory's the moment it is free.
 extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u32) -> BOOL {
     const MEM_COALESCE_PLACEHOLDERS: u32 = 1;
+    // Renderer port 1 placed: freeing, decommitting, splitting or joining
+    // there would unmap the card's memory under the title (Wine maps
+    // anonymous memory over it): the placed mapping is let go first and the
+    // title's views put back, so that the call meets what it did before.
+    if PLACED_ANY.load(Ordering::Relaxed) {
+        let mut physical = physical();
+        if physical.placed_touching(address as usize, size.max(1)).is_some() {
+            let _changing = victory_gpu::title_memory_remapping();
+            tracing::warn!(
+                address = format_args!("{address:p}"),
+                size,
+                kind = format_args!("{kind:#x}"),
+                "renderer port 1 placed: the title's VirtualFree in the placed reservation"
+            );
+            unplace(&mut physical, address as usize, size.max(1), "the title's VirtualFree of it");
+        }
+    }
     // Splitting and joining placeholders changes nothing they show.
     if kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) == 0 {
         victory_gpu::title_memory_freed(address as usize, size);
