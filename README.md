@@ -21,8 +21,10 @@ Wine (`wine_get_version`) and leave Windows behavior unchanged.
 - **GPU & memory stability under Wine**: safe descriptor publication
   (`VICTORY_PUBLISH_SAFE`), zero-address and null-buffer guards
   (`VICTORY_NULL_BUFFER_ZEROS`), hardened texture read-back
-  (`VICTORY_FETCH_MARK`), and runtime placeholder hole tracking to avoid
-  per-frame `VirtualQuery` lock contention (`VICTORY_WINE_HOLES`).
+  (`VICTORY_FETCH_MARK`), runtime placeholder hole tracking to avoid per-frame
+  `VirtualQuery` lock contention (`VICTORY_WINE_HOLES`), and placed Vulkan
+  memory for Port 1 (`VICTORY_PORT_PLACED=1` via the companion implicit layer,
+  placing the 185 MB constants heap directly at the title's address).
 - **PC mouse + keyboard input**: opt-in `VICTORY_MOUSE=1` camera/trigger mouse
   support (see [docs/README-fxceless.md](docs/README-fxceless.md)).
 
@@ -43,26 +45,35 @@ lighting that is too bright or too dark when walking indoors are next in line.
 copy of the game. It is not affiliated with or endorsed by the game's developer
 or publisher.
 
-## Where it stands (2026-11-26)
+## Where it stands (2026-11-27)
 
-Tested on one machine only: Windows 11, Intel i9-12900K, 64 GB RAM, Radeon
-RX 7900 XTX, the Series X profile, ray tracing off.
+Measured on Linux: kernel 7.0, AMD Ryzen 5 7600X (6c/12t), 32 GB RAM, Radeon
+RX 7900 XTX 24 GB, standalone Mesa RADV 26.3.1, `vkd3d-proton 3.2.0`, patched
+view-tree `wineserver`, `diag` build (`--features diagnostics`, commit
+`e8e8c78`), Series X profile, ray tracing off, with `VICTORY_PORT_CONSTANTS=1`,
+`VICTORY_PORT_PLACED=1`, `VICTORY_LAND_THREADS=6`, and `VICTORY_MOUSE=1`.
 
 | | |
 |---|---|
-| City street, renderer patches 1+2 on | about 53 ms a frame (about 19 fps) |
-| Same scene before the patches | 57-75 ms (13-17 fps) |
+| Boat level, idle (~4,015 draws/frame, 100 s steady window) | **22.8 fps average** (20.9–23.6 fps), **43.9 ms/frame** (42.4–47.8 ms: 30.3 ms preparing, 0.0 ms GPU wait, 14.0 ms copying back) |
+| Cutscene (~1,580 draws/frame) | up to **29.4 fps** (34.0–34.7 ms/frame) |
+| Port 1 placed heap (`VICTORY_PORT_PLACED=1`) | 1 heap placed (185 MB), 0 fallbacks |
 | Shaders the title uses that translate | all of them (25,790 of 25,985; the rest are unused geometry shaders) |
-| Memory | about 35 GB of private memory: **64 GB of RAM recommended** for now |
+| Memory (12.6 min run on 32 GB host) | **~9.3 GiB RSS + ~3.4 GiB swap (~12.7 GiB steady)**; peak 11.8 GiB RSS / 14.4 GiB RSS+swap |
+| Upstream Windows baseline (2026-11-26, i9-12900K, 64 GB, 7900 XTX) | ~19 fps (~53 ms/frame) with renderer patches 1+2; ~35 GB private memory |
 
-It started at 280 ms a frame in the same scenes three days earlier.
+It started at 280 ms a frame in the same scenes on upstream four days earlier.
+Note that the `diag` build includes `--features diagnostics` timing overhead; a
+plain `--release` build removes that overhead.
 
-### Renderer patches (off by default while they are tested)
+### Renderer patches & tuning switches
 
 | Switch | What it does |
 |---|---|
-| `VICTORY_PORT_CONSTANTS=1` | The title's 174 MB constants heap is read by the card where the title writes it: no uploads, no fills |
+| `VICTORY_PORT_CONSTANTS=1` | The title's 174–185 MB constants heap is read by the card where the title writes it: no uploads, no fills |
+| `VICTORY_PORT_PLACED=1` | Places the Port 1 heap directly at the title's virtual address (requires the placed-memory Vulkan layer on Linux/vkd3d-proton) |
 | `VICTORY_PORT_DESCRIPTORS=1` | The title's descriptor-table stores are patched (byte-checked) to report the slots they write, instead of a scan of ~600,000 slots a frame |
+| `VICTORY_LAND_THREADS=6` | Overrides relay landing worker count (default `threads / 4`; 6 threads on a 6c/12t CPU cuts copy-back time) |
 
 What is known to be wrong:
 
