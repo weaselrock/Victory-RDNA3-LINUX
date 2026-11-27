@@ -591,6 +591,156 @@ pub fn batch_clamps(
     (out, done)
 }
 
+/// The root signature and pipeline of the stand-in's hold of the reflections
+/// (`crate::ambient`), in lists edited by [`hold_reflections`].
+pub const HOLD_ROOT: u32 = u32::MAX - 5;
+pub const HOLD: u32 = u32::MAX - 5;
+
+/// Where the hold reads and writes: the image through a table of the
+/// title's pipeline (which root constant holds the table's start in the view
+/// heap, in bytes, as `--flow` numbers them, and how many descriptors into it),
+/// and the stand-in's cells and points, as its gather pass had them bound.
+#[derive(Clone, Debug, Default)]
+pub struct Hold {
+    pub param: u32,
+    pub index: u32,
+    pub words: Vec<u32>,
+    /// Cells and points, once the gather (a dispatch of 20x45 groups by a
+    /// pipeline of ours: not among the title's, `named`) has been seen.
+    pub buffers: Option<(Va, Va)>,
+    /// Holds put in, and resolves met before the buffers were.
+    pub done: u32,
+    pub early: u32,
+}
+
+/// The stand-in's hold of the reflections after each dispatch of a pipeline
+/// of `targets`, as the layer records it in a game; the list's compute
+/// state is set again after it.
+pub fn hold_reflections(
+    cmds: Vec<Cmd>,
+    targets: &HashSet<u32>,
+    named: &HashSet<u32>,
+    hold: &mut Hold,
+) -> Vec<Cmd> {
+    let mut out = Vec::with_capacity(cmds.len());
+    let mut bound = NONE;
+    // The compute state since its root signature was set: set again after.
+    let mut state: Vec<Cmd> = Vec::new();
+    let mut constants: Vec<u32> = Vec::new();
+    let mut heap = None;
+    let mut views: HashMap<u32, Va> = HashMap::new();
+    for c in cmds {
+        match &c {
+            Cmd::Pipeline { pso } => bound = *pso,
+            Cmd::Heaps { heaps } => heap = heaps.first().copied(),
+            Cmd::RootSignature {
+                graphics: false, ..
+            } => {
+                state.clear();
+                constants.clear();
+                views.clear();
+                state.push(c.clone());
+            }
+            Cmd::Table {
+                graphics: false, ..
+            } => state.push(c.clone()),
+            Cmd::Constants {
+                graphics: false,
+                param: 0,
+                offset,
+                values,
+            } => {
+                let end = *offset as usize + values.len();
+                if constants.len() < end {
+                    constants.resize(end, 0);
+                }
+                constants[*offset as usize..end].copy_from_slice(values);
+                state.push(c.clone());
+            }
+            Cmd::Constants {
+                graphics: false, ..
+            } => state.push(c.clone()),
+            Cmd::RootView {
+                graphics: false,
+                param,
+                va,
+                ..
+            } => {
+                views.insert(*param, va.clone());
+                state.push(c.clone());
+            }
+            _ => {}
+        }
+        let dispatch = matches!(c, Cmd::Dispatch { .. } | Cmd::Indirect { .. });
+        if let Cmd::Dispatch {
+            groups: [20, 45, 1],
+        } = c
+            && !named.contains(&bound)
+            && let (Some(cells), Some(points)) = (views.get(&3), views.get(&4))
+        {
+            hold.buffers = Some((cells.clone(), points.clone()));
+        }
+        out.push(c);
+        if !dispatch || !targets.contains(&bound) {
+            continue;
+        }
+        let (Some((cells, points)), Some(heap), Some(&start)) = (
+            hold.buffers.clone(),
+            heap,
+            constants.get(hold.param as usize),
+        ) else {
+            hold.early += 1;
+            continue;
+        };
+        let at = start / 32 + hold.index;
+        let uav = Barrier::Uav {
+            flags: 0,
+            res: NONE,
+        };
+        let table = |param| Cmd::Table {
+            graphics: false,
+            param,
+            heap,
+            slot: at,
+        };
+        let view = |param, va| Cmd::RootView {
+            graphics: false,
+            kind: slot::UAV,
+            param,
+            va,
+        };
+        out.extend([
+            Cmd::Barriers {
+                all: vec![uav.clone()],
+            },
+            Cmd::RootSignature {
+                graphics: false,
+                root: HOLD_ROOT,
+            },
+            Cmd::Pipeline { pso: HOLD },
+            Cmd::Constants {
+                graphics: false,
+                param: 0,
+                offset: 0,
+                values: hold.words.clone(),
+            },
+            table(1),
+            table(2),
+            view(3, cells),
+            view(4, points),
+            // Up to 3840x2160; the pass leaves out what lies outside.
+            Cmd::Dispatch {
+                groups: [480, 270, 1],
+            },
+            Cmd::Barriers { all: vec![uav] },
+            Cmd::Pipeline { pso: bound },
+        ]);
+        out.extend(state.iter().cloned());
+        hold.done += 1;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

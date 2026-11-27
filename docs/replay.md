@@ -69,6 +69,7 @@ with the presented one.
 | `--only 3..7` | runs these lists; of the others only barriers |
 | `--no-merge` | copies of what the CPU wrote also overwrite the card's own results (below) |
 | `--skip-shader <text>` | leaves out what runs pipelines with the text in their name or DXIL hash (repeatable) |
+| `--reflect <text>:<table>+<descriptor>:<multiple>` | after each dispatch of the pipelines with the text in their name or DXIL hash, the stand-in's hold of the reflections (`VICTORY_AMBIENT_REFLECT`, `ambient.rs`) on the image at that place of the tables (`[5]+16` in `--flow` is `5+16`), with the stand-in's buffers as the frame's gather pass bound them (a capture recorded with `VICTORY_AMBIENT`); repeatable |
 | `--shaders <folder>` | takes shaders from the folder where it has them: `<hash>.dxil`, by the hash the runtime names the title's shader by (a pass of ours: its own DXIL hash); with `--compare --shaders-b <folder>` a second set, turn by turn with the first |
 | `--retranslate <folder>` | only writes that folder: the capture's shaders translated by this build with the `VICTORY_*` switches of this run (`--view-limit`, `--raw-views`: the view heap's null slot and where raw views start, as the capture's shaders have them) |
 | `--no-restore` | leaves what a loop changed, and makes no copies to restore from (of a capture that does not fit in the card's memory with them) |

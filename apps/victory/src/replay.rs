@@ -99,6 +99,12 @@ pub(crate) struct Replay {
     /// (may be given several times).
     #[arg(long = "skip-shader")]
     skip_shader: Vec<String>,
+    /// The stand-in's hold of the reflections (VICTORY_AMBIENT_REFLECT) after
+    /// the pipelines whose name or DXIL hash has <text> in it:
+    /// `<text>:<table>+<descriptor>:<multiple>` (the image's place as
+    /// `--flow` shows it: `[5]+16` is 5+16; may be given several times).
+    #[arg(long)]
+    reflect: Vec<String>,
     /// Find the commands that make identical runs differ: each list is run
     /// this often from the same memory.
     #[arg(long, num_args = 0..=1, default_missing_value = "3")]
@@ -266,6 +272,23 @@ pub(crate) fn run(r: Replay) -> Result<()> {
         ),
         None => None,
     };
+    let mut reflect = Vec::new();
+    for text in &r.reflect {
+        let hold = (|| {
+            let (shader, rest) = text.split_once(':')?;
+            let (at, most) = rest.split_once(':')?;
+            let (param, index) = at.split_once('+')?;
+            Some((
+                shader.to_owned(),
+                param.parse().ok()?,
+                index.parse().ok()?,
+                most.parse().ok()?,
+            ))
+        })();
+        reflect.push(hold.with_context(|| {
+            format!("--reflect {text}: not <text>:<table>+<descriptor>:<multiple>")
+        })?);
+    }
     let options = Options {
         loops: r.loops.max(1),
         restore: !r.no_restore,
@@ -297,6 +320,7 @@ pub(crate) fn run(r: Replay) -> Result<()> {
         compare: r.compare,
         debug: r.debug_layer,
         breadcrumbs: r.breadcrumbs,
+        reflect,
     };
     if let Some(text) = &r.slots {
         let (list, command) = text

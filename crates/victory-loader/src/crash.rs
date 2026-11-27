@@ -17,8 +17,8 @@ use windows_sys::Win32::Foundation::{
 };
 
 use windows_sys::Win32::System::Diagnostics::Debug::{
-    AddVectoredExceptionHandler, CONTEXT, EXCEPTION_POINTERS, M128A, RtlLookupFunctionEntry,
-    RtlVirtualUnwind, SetUnhandledExceptionFilter, UNW_FLAG_NHANDLER,
+    AddVectoredExceptionHandler, CONTEXT, EXCEPTION_POINTERS, IMAGE_RUNTIME_FUNCTION_ENTRY, M128A,
+    RtlLookupFunctionEntry, RtlVirtualUnwind, SetUnhandledExceptionFilter, UNW_FLAG_NHANDLER,
 };
 use windows_sys::Win32::System::LibraryLoader::{
     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -678,6 +678,11 @@ pub(crate) fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mu
             context.Rip = unsafe { (rsp as *const u64).read() };
             context.Rsp += 8;
         } else {
+            // The unwinder reads through the frame register: one off the stack
+            // (a thread caught in a prologue) faulted inside Wine's at address 0.
+            if !frame_register_on_stack(image, entry, context, low, high) {
+                break;
+            }
             let (mut data, mut frame) = (null_mut(), 0);
             // SAFETY: `entry` belongs to `image`; the context is our copy.
             unsafe {
@@ -698,6 +703,25 @@ pub(crate) fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mu
         }
         frames.push(context.Rip);
     }
+}
+
+/// Whether the frame register that `entry`'s unwind info names, if any,
+/// points into the stack `low..high`.
+fn frame_register_on_stack(
+    image: u64,
+    entry: *const IMAGE_RUNTIME_FUNCTION_ENTRY,
+    context: &CONTEXT,
+    low: usize,
+    high: usize,
+) -> bool {
+    // SAFETY: an entry of `image`'s function table; its unwind info lies in
+    // the image, with the frame register in the low 4 bits of byte 3.
+    let register = unsafe { *((image as usize + (*entry).Anonymous.UnwindData as usize + 3) as *const u8) } & 0xf;
+    let c = context;
+    let registers = [
+        c.Rax, c.Rcx, c.Rdx, c.Rbx, c.Rsp, c.Rbp, c.Rsi, c.Rdi, c.R8, c.R9, c.R10, c.R11, c.R12, c.R13, c.R14, c.R15,
+    ];
+    register == 0 || (low..high).contains(&(registers[usize::from(register)] as usize))
 }
 
 /// `module+rva`, or the bare address.

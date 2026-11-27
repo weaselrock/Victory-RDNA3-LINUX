@@ -108,6 +108,12 @@ pub struct Options {
     /// The system's breadcrumbs after every command, as
     /// `VICTORY_D3D12_DRED=light` has them.
     pub breadcrumbs: bool,
+    /// The stand-in's hold of the reflections (`crate::ambient`) after each
+    /// dispatch of the pipelines whose name or DXIL hash has the text in it,
+    /// on the image in the table whose start that root constant holds, that
+    /// many descriptors in; held to that multiple of the light around.
+    /// (Repeatable.)
+    pub reflect: Vec<(String, u32, u32, f32)>,
 }
 
 impl Default for Options {
@@ -139,6 +145,7 @@ impl Default for Options {
             compare: false,
             debug: false,
             breadcrumbs: false,
+            reflect: Vec::new(),
         }
     }
 }
@@ -155,6 +162,7 @@ impl Options {
             || self.wait_lists
             || self.only.is_some()
             || !self.skip_shaders.is_empty()
+            || !self.reflect.is_empty()
     }
 
     /// The same without the experiments.
@@ -171,6 +179,7 @@ impl Options {
             awake: false,
             only: None,
             skip_shaders: Vec::new(),
+            reflect: Vec::new(),
             ..self.clone()
         }
     }
@@ -2027,6 +2036,41 @@ impl Player {
             .filter(|p| p.parts.iter().any(|part| matches!(part, wire::Part::Code { kind, .. } if *kind == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS.0)))
             .map(|p| p.id)
             .collect();
+        let matching = |text: &str| -> HashSet<u32> {
+            self.frame
+                .pipelines
+                .iter()
+                .filter(|p| {
+                    p.name.contains(text) || self.hashes(p).iter().any(|h| h.contains(text))
+                })
+                .map(|p| p.id)
+                .collect()
+        };
+        let named: HashSet<u32> = self
+            .frame
+            .pipelines
+            .iter()
+            .filter(|p| !p.name.trim().is_empty())
+            .map(|p| p.id)
+            .collect();
+        let sets: Vec<HashSet<u32>> = o.reflect.iter().map(|(text, ..)| matching(text)).collect();
+        let mut holds = Vec::new();
+        for ((_, param, index, most), targets) in o.reflect.iter().zip(sets) {
+            let mut hold = edit::Hold {
+                param: *param,
+                index: *index,
+                ..Default::default()
+            };
+            match crate::ambient::hold_pass(&self.device, *most) {
+                Ok((root, pso, words)) => {
+                    self.roots.insert(edit::HOLD_ROOT, root);
+                    self.pipelines.insert(edit::HOLD, pso);
+                    hold.words = words;
+                    holds.push((targets, hold));
+                }
+                Err(e) => report.notes.push(format!("--reflect: no pass: {e}")),
+            }
+        }
         let mut batched = edit::Batched::default();
         let mut jobs = Vec::new();
         let mut scratches = Vec::new();
@@ -2073,6 +2117,9 @@ impl Player {
                         scratches.push((scratch, done.scratch));
                     }
                 }
+                for (targets, hold) in &mut holds {
+                    cmds = edit::hold_reflections(cmds, targets, &named, hold);
+                }
                 let mut n;
                 if !skip.is_empty() {
                     (cmds, n) = edit::skip_pipelines(cmds, &skip);
@@ -2102,6 +2149,14 @@ impl Player {
             if let Err(e) = self.make_batches(&jobs, &scratches) {
                 report.notes.push(format!("--batch-clamps failed: {e:#}"));
             }
+        }
+        for (targets, hold) in &holds {
+            report.notes.push(format!(
+                "--reflect: {} pipelines match, {} holds, {} dispatches before the stand-in's buffers were seen",
+                targets.len(),
+                hold.done,
+                hold.early
+            ));
         }
         if !skip.is_empty() {
             report

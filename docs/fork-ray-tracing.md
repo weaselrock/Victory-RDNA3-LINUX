@@ -159,6 +159,19 @@ fork's constant.
 | `VICTORY_AMBIENT=constant:<level>` | the same light everywhere |
 | `VICTORY_AMBIENT_SHADE=<strength>,<metres>` | the creases (1,0.6) |
 | `VICTORY_AMBIENT_AIR=<multiple>` | what the air scatters is bounded by a multiple of the light around (off: the brown veil in the day room stays with it, light-14) |
+| `VICTORY_AMBIENT_REFLECT=<multiple>` | the traced reflections are held to a multiple of the light around (unset: 1; `0`/`off`: the title's own) |
+
+The reflections miss too, and take the title's environment cube instead: the
+open sky on every glossy and transparent surface, indoors as well (a cornea
+near-white, a door's pane showing the outdoors through the walls). Right
+after the two programs that resolve them (`CS_TemporalResolve2_Opaque_*`,
+`CS_TemporalResolve1_Alpha_*`) each texel is held to a multiple of the
+estimate's light around it, hue kept: one pass over the picture's texels
+each. The hold after the resolve is beloooo's too (44dcd437, after
+`CS_UpdateHistory`, which runs after the copy the eyes read). On a recorded
+cell (capture-2) a multiple of 1 gave natural eyes and see-through panes,
+and changed 3% of the picture: panes, eyes, the glossy floor's patches, a
+metal locker. Replay: `--reflect <shader>:<table>+<descriptor>:<multiple>`.
 
 It is off while the builder runs.
 
