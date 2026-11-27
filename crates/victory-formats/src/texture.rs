@@ -625,6 +625,21 @@ impl Layout {
             .min(self.size)
     }
 
+    /// Checks the same subresource and buffer bounds as [`Layout::detile`]
+    /// without reading or writing either buffer.
+    pub fn check_detile(
+        &self,
+        tiled_len: usize,
+        mip: u32,
+        slice: u32,
+        linear_len: usize,
+        row_pitch: usize,
+        depth_pitch: usize,
+    ) -> Result<(), Error> {
+        self.checked_mip::<true>(tiled_len, mip, slice, linear_len, row_pitch, depth_pitch)
+            .map(|_| ())
+    }
+
     /// Copies one subresource out of tiled memory (the whole texture,
     /// [`Layout::size`] bytes, or the [`Layout::bytes_from`] of the mip)
     /// into linear rows: mip `mip` of array slice
@@ -655,31 +670,18 @@ impl Layout {
         self.walk::<false>(linear, tiled, mip, slice, row_pitch, depth_pitch)
     }
 
-    /// Copies contiguous runs in one direction between the two layouts.
-    ///
-    /// Every buffer, pitch and overflow check runs before the first copy,
-    /// so a refused copy leaves the destination exactly as it was.
-    #[allow(clippy::too_many_arguments)]
-    fn walk<const DETILE: bool>(
+    fn checked_mip<const DETILE: bool>(
         &self,
-        src: &[u8],
-        dst: &mut [u8],
+        tiled_len: usize,
         mip: u32,
         slice: u32,
+        linear_len: usize,
         row_pitch: usize,
         depth_pitch: usize,
-    ) -> Result<(), Error> {
+    ) -> Result<&Mip, Error> {
         let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
         let depth = m.depth;
-        let first = if self.desc.dimension == Dimension::Tex3d {
-            if slice != 0 {
-                return Err(Error::Invalid);
-            }
-            0
-        } else {
-            slice
-        };
-        if first >= self.slices {
+        if (self.desc.dimension == Dimension::Tex3d && slice != 0) || slice >= self.slices {
             return Err(Error::Invalid);
         }
         if !self.addressable() {
@@ -701,15 +703,37 @@ impl Layout {
             .checked_mul(depth_pitch)
             .and_then(|offset| offset.checked_add(slice_bytes))
             .ok_or(Error::TooSmall)?;
+        let tiled_need = if DETILE { self.bytes_from(mip) } else { self.size };
+        if (tiled_len as u64) < tiled_need || linear_len < need || row_pitch < bytes {
+            return Err(Error::TooSmall);
+        }
+        Ok(m)
+    }
+
+    /// Copies contiguous runs in one direction between the two layouts.
+    ///
+    /// Every buffer, pitch and overflow check runs before the first copy,
+    /// so a refused copy leaves the destination exactly as it was.
+    #[allow(clippy::too_many_arguments)]
+    fn walk<const DETILE: bool>(
+        &self,
+        src: &[u8],
+        dst: &mut [u8],
+        mip: u32,
+        slice: u32,
+        row_pitch: usize,
+        depth_pitch: usize,
+    ) -> Result<(), Error> {
         let (tiled_len, linear_len) = if DETILE {
             (src.len(), dst.len())
         } else {
             (dst.len(), src.len())
         };
-        let tiled_need = if DETILE { self.bytes_from(mip) } else { self.size };
-        if (tiled_len as u64) < tiled_need || linear_len < need || row_pitch < bytes {
-            return Err(Error::TooSmall);
-        }
+        let m = self.checked_mip::<DETILE>(tiled_len, mip, slice, linear_len, row_pitch, depth_pitch)?;
+        let depth = m.depth;
+        let first = slice;
+        let n = self.desc.element_bytes as usize;
+        let bytes = m.width as usize * n;
         // All checks are done; the copies below only touch the buffers the
         // checks sized, so an error above leaves `dst` untouched.
         if self.desc.swizzle == Swizzle::LINEAR {
@@ -1286,6 +1310,25 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn detile_preflight_matches_the_copy() {
+        let layout = Layout::new(&desc(3, 2, 1, 1, Swizzle::LINEAR)).unwrap();
+        let tiled = vec![7; layout.size as usize];
+        let size = tiled.len();
+        for (mip, slice, src_len, dst_len, pitch, expected) in [
+            (0, 0, size, 6, 3, Ok(())),
+            (1, 0, size, 6, 3, Err(Error::Invalid)),
+            (0, 1, size, 6, 3, Err(Error::Invalid)),
+            (0, 0, size - 1, 6, 3, Err(Error::TooSmall)),
+            (0, 0, size, 5, 3, Err(Error::TooSmall)),
+            (0, 0, size, 6, 2, Err(Error::TooSmall)),
+        ] {
+            let mut linear = vec![0; dst_len];
+            assert_eq!(layout.check_detile(src_len, mip, slice, dst_len, pitch, 6), expected);
+            assert_eq!(layout.detile(&tiled[..src_len], mip, slice, &mut linear, pitch, 6), expected);
         }
     }
 

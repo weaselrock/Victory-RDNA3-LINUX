@@ -158,6 +158,12 @@ pub(super) fn writers(items: &[Late]) -> Vec<Writer> {
                         });
                     }
                 }
+                out.extend(flight.texture_back_ranges.iter().map(|&(from, to)| Writer {
+                    shadow: None,
+                    from,
+                    to,
+                    copy: false,
+                }));
                 out.extend(flight.own.iter().flat_map(Taken::copied));
             }
             Late::Write(at, _, bytes) => out.push(Writer {
@@ -1184,6 +1190,43 @@ mod tests {
     fn what_no_host_copy_holds_is_refused() {
         let writers = [Writer { shadow: None, from: 100, to: 108, copy: false }];
         assert!(holder(&writers, 104, 120).is_err());
+    }
+
+    /// Texture copy-back ranges in a flight (`texture_back_ranges`) land in
+    /// title memory rather than a host copy, so `writers()` marks them without
+    /// a shadow and `holder()` refuses overlapping reads while leaving
+    /// disjoint or touching reads unaffected.
+    #[test]
+    fn texture_copy_back_writers_refuse_overlapping_reads() {
+        let flight = Flight {
+            number: 1,
+            fence: 1,
+            lists: Vec::new(),
+            order: Vec::new(),
+            card: None,
+            back: Vec::new(),
+            own: None,
+            texture_back_ranges: vec![(100, 108)],
+        };
+        let writers = writers(&[Late::Run(flight)]);
+        assert_eq!(writers.len(), 1);
+        assert!(writers[0].shadow.is_none());
+        assert!(!writers[0].copy);
+        assert_eq!((writers[0].from, writers[0].to), (100, 108));
+        for (from, to) in [(96, 101), (100, 108), (104, 120)] {
+            assert_eq!(
+                holder(&writers, from, to).err(),
+                Some("a read-back or a value behind a flight is written there"),
+                "overlapping range [{from}, {to}) should be refused"
+            );
+        }
+        for (from, to) in [(90, 100), (108, 120)] {
+            assert_ne!(
+                holder(&writers, from, to).err(),
+                Some("a read-back or a value behind a flight is written there"),
+                "disjoint range [{from}, {to}) should not hit the texture copy-back writer"
+            );
+        }
     }
 
     /// Reads are all before writes, between two buffers and within one, and

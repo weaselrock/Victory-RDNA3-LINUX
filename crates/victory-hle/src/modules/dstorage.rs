@@ -1323,6 +1323,25 @@ fn queue(this: QueueRef, command: Command) {
             break;
         }
         if !lane.unsubmitted.is_empty() && lane.reads.is_empty() && lane.running.is_empty() {
+            let page_list = !half_submits()
+                && (matches!(&command, Command::Read(r) if r.request.options & PAGE_DESTINATION != 0)
+                    || lane.unsubmitted.iter().any(|c| {
+                        matches!(c, Command::Read(r) if r.request.options & PAGE_DESTINATION != 0)
+                    }));
+            if page_list {
+                // Requests with page-list destinations (`PAGE_DESTINATION`)
+                // cannot auto-submit before the title finishes mapping and
+                // filling in their page lists at `Submit`; hold them instead.
+                if lane.unsubmitted.len() + 1 == lane.capacity.max(2) {
+                    tracing::warn!(
+                        queue = id,
+                        commands = lane.unsubmitted.len(),
+                        capacity = lane.capacity,
+                        "dstorage: full queue with page-list destinations waits for Submit"
+                    );
+                }
+                break;
+            }
             tracing::warn!(
                 queue = id,
                 commands = lane.unsubmitted.len(),
@@ -2029,6 +2048,43 @@ mod tests {
         };
         assert!(bytes(stale) == [0; 6400], "written to the page the list named before");
         assert!(bytes(right) == plain.repeat(100), "not written to the page the list names");
+    }
+
+    #[test]
+    fn full_page_list_queue_waits_for_the_submit() {
+        use crate::modules::xmem;
+        let mut pages = [0usize; 2];
+        let mut n = 2;
+        assert_eq!(xmem::XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+        let [stale, right] = pages;
+        let plain = pattern(64);
+        let mut list = [stale];
+        let (queue, array) = (new_queue(1), status_array(1));
+        // More than the queue's 128 capacity before Submit: must hold for
+        // Submit instead of auto-submitting onto the stale page list.
+        for i in 0..140 {
+            let mut r = request(
+                PAGE_DESTINATION | MEMORY_SOURCE,
+                list.as_mut_ptr().cast(),
+                plain.len(),
+                plain.as_ptr().cast(),
+                0,
+                plain.len(),
+            );
+            r.page_offset = i * 64;
+            enqueue(queue, &r);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        // SAFETY: our own list, which no worker may read until Submit.
+        unsafe { std::ptr::write_volatile(list.as_mut_ptr(), right) };
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        let bytes = |page: usize| -> Vec<u8> {
+            xmem::page_window(&[page], 0, 140 * 64).unwrap().bytes().to_vec()
+        };
+        assert!(bytes(stale) == [0; 140 * 64], "written to the page the list named before");
+        assert!(bytes(right) == plain.repeat(140), "not written to the page the list names");
     }
 
     #[test]

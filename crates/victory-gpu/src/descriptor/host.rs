@@ -742,11 +742,17 @@ impl Spans {
         let rule = self.rule;
         // The spans the view cannot be there with.
         let clashing: Vec<u64> = match rule {
-            Rule::Start => self
-                .by_start
-                .range(start.saturating_sub(HEAD - 1)..start.saturating_add(HEAD))
-                .map(|(at, _)| *at)
-                .collect(),
+            Rule::Start => {
+                // Cap each texture's head block at its own size so small
+                // neighbouring views packed inside `HEAD` bytes (e.g. tint
+                // palettes) do not make non-overlapping neighbours stale.
+                let head_end = end.min(start.saturating_add(HEAD));
+                self.by_start
+                    .range(start.saturating_sub(HEAD - 1)..head_end)
+                    .filter(|&(&at, &(old_end, _))| at >= start || old_end > start)
+                    .map(|(&at, _)| at)
+                    .collect()
+            }
             Rule::Overlap | Rule::Never => self.overlapping(start, end),
         };
         let mut stale = Vec::new();
@@ -6006,6 +6012,29 @@ mod tests {
         assert!(spans.note(8, at + 0x900, at + 0x2900, false).is_empty());
         assert_eq!(spans.by_slot.get(&8), None);
         assert_eq!(spans.by_slot.len(), 3);
+    }
+
+    /// Small non-overlapping textures packed within `HEAD` (4 KiB) of one
+    /// another (e.g. 512 B tint palettes) stay alive instead of making their
+    /// neighbours stale; an overlapping replacement still replaces the one it
+    /// overlaps.
+    #[test]
+    fn small_non_overlapping_neighbours_within_head_stay() {
+        let mut spans = Spans::default();
+        let at = 0x8_0000_0000u64;
+        assert!(spans.note(1, at, at + 0x200, true).is_empty());
+        assert!(spans.note(2, at + 0x200, at + 0x400, true).is_empty());
+        assert!(spans.note(3, at + 0x400, at + 0x800, true).is_empty());
+        assert!(spans.note(4, at + 0x800, at + 0x1000, true).is_empty());
+        let mut all = spans.slots_in(0, u64::MAX);
+        all.sort_unstable();
+        assert_eq!(all, [1, 2, 3, 4]);
+
+        // An overlapping view still replaces the neighbour whose head it overlaps.
+        assert_eq!(spans.note(5, at + 0x300, at + 0x600, true), [2, 3]);
+        let mut left = spans.slots_in(0, u64::MAX);
+        left.sort_unstable();
+        assert_eq!(left, [1, 4, 5]);
     }
 
     /// A slot written with another texture leaves its old span; the same
