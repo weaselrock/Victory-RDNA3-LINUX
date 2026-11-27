@@ -210,7 +210,7 @@ impl Tables {
             })
             .collect();
         let bc7 = (0..DICTIONARY)
-            .map(|_| {
+            .map(|entry| {
                 let mut ep = Bc7Ep {
                     ctrl: r.u16(),
                     ..Default::default()
@@ -222,11 +222,18 @@ impl Tables {
                     bits: [r.u8(), r.u8()],
                     ..Default::default()
                 };
-                // Unused: the widths again in all entries but the first.
-                r.u16();
-                // Only 15 slots for set 1, which no entry uses (0 bits).
-                for v in &mut ix.ix.as_flattened_mut()[..31] {
-                    *v = r.u16() as i16;
+                if entry == 0 {
+                    // The first entry has all 32 indices right after the width
+                    // bytes; every later entry repeats the widths first.
+                    for v in ix.ix.as_flattened_mut() {
+                        *v = r.u16() as i16;
+                    }
+                } else {
+                    r.u16();
+                    // Only 15 slots for set 1, which no entry uses (0 bits).
+                    for v in &mut ix.ix.as_flattened_mut()[..31] {
+                        *v = r.u16() as i16;
+                    }
                 }
                 (ep, ix)
             })
@@ -344,9 +351,8 @@ impl Lane {
             return Ok(());
         }
         let mut x = self.x;
-        if x < LOW
-            && let Some(b) = self.latch.take()
-        {
+        let refill = if x < LOW { self.latch.take() } else { None };
+        if let Some(b) = refill {
             self.left = self.left.wrapping_sub(1);
             x = x << 8 | u32::from(b);
         }
@@ -370,17 +376,14 @@ impl Lane {
             };
             self.x = (x >> 16).wrapping_mul(f).wrapping_add(rem);
             self.out = Some(sym as u8);
-        } else if self.left != 0 {
-            // At exactly 2^24 the lane neither reads nor decodes again; only a
-            // lane that has delivered its symbols may end up there.
+        } else if self.left != 0 || (refill.is_some() && x < LOW) {
+            // A final byte that still leaves x below LOW goes through the
+            // drain phase for one step before this lane asks for a header.
             self.x = x;
         } else {
-            // The fragment ends; a byte read in this step does not reach the carried state.
             self.phase = 0;
             self.need = self.latch.is_none();
-            if self.reset {
-                self.x = 0;
-            }
+            self.x = if self.reset { 0 } else { x };
         }
         Ok(())
     }
@@ -425,13 +428,19 @@ fn lanes(
     let (mut pos, mut done, mut idle) = (0, 0u32, 0);
     // Where symbol `pos` of lane 0 goes; lane j's is `per * j` further on.
     let mut at = 0;
-    while pos < blocks * per {
+    let symbols = blocks * per;
+    while pos < symbols {
         let (mut taken, mut moved) = (0, false);
         for (j, lane) in lanes.iter_mut().enumerate() {
             let bit = 1 << j;
             let before = taken;
             if !lane.stalled {
                 lane.step(t)?;
+            }
+            // A lane may still need the tail of its current payload after its
+            // last symbol. Once both are exhausted it cannot start a header.
+            if pos + 1 == symbols && done & bit != 0 && lane.left == 0 {
+                continue;
             }
             let waiting = lane.out.is_some() && done & bit != 0;
             if lane.need && !waiting && taken < ROUND_BYTES {
@@ -1236,9 +1245,7 @@ mod tests {
         out
     }
 
-    /// Interleaves per-lane fragments the way the decoder takes bytes. A lane
-    /// that has finished still asks: a filler fragment (two payload bytes)
-    /// brings its state to 2^24 with a byte latched, which parks it for good.
+    /// Interleaves per-lane fragments in the order the decoder takes bytes.
     fn stream(t: &Tables, widths: &[u8], per: usize, records: &[Vec<u8>]) -> Vec<u8> {
         let stride = widths.len() * per;
         let mut queues: Vec<std::collections::VecDeque<u8>> = (0..widths.len())
@@ -1247,9 +1254,7 @@ mod tests {
                     .iter()
                     .flat_map(|r| r[j * per..j * per + per].to_vec())
                     .collect();
-                let mut bytes = fragment(widths[j], &syms);
-                bytes.extend([0, 1, 0, 0]);
-                bytes.into()
+                fragment(widths[j], &syms).into()
             })
             .collect();
         let mut out = Vec::new();
@@ -1257,7 +1262,7 @@ mod tests {
         let fetch = |j: usize| {
             let b = queues[j]
                 .pop_front()
-                .expect("a parked lane asked for input");
+                .expect("a lane read past its fragment");
             out.push(b);
             Some(b)
         };
@@ -1274,6 +1279,44 @@ mod tests {
         } else {
             (-2 * v - 1) as u8
         }
+    }
+
+    #[test]
+    fn finished_lanes_leave_the_remaining_payload_for_their_peers() {
+        // One zero symbol per BC4 lane, using the uniform 6-bit alphabet.
+        // Symbol 0 has frequency 1023 and starts at 1. Inverting the rANS
+        // step from 2^24 gives the four big-endian payload bytes below.
+        let state = ((LOW / 1023) << 16) + (LOW % 1023) + 1;
+        let mut src = Vec::new();
+        // The feeder serves eight lanes per round. These fragments request
+        // a byte on every round, so lanes 0..8 finish before 8..12 start.
+        for batch in [0..8, 8..12] {
+            src.extend(batch.clone().map(|lane| if lane < 4 { 0x90 } else { 0x10 }));
+            src.extend(std::iter::repeat_n(3, batch.len()));
+            for byte in state.to_be_bytes() {
+                src.extend(std::iter::repeat_n(byte, batch.len()));
+            }
+        }
+        let mut dst = [0xff; 8];
+        decode(4, &src, &mut dst, &Tables::parse(&tables()).unwrap()).unwrap();
+        assert_eq!(dst, [128, 128, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_last_symbol_can_precede_its_final_payload_bytes() {
+        // Lane 0 produces 0 and 31 in one fragment and retains the two
+        // trailing zero bytes that refill its state to LOW. Lane 1 produces
+        // its two zeros in separate fragments. If lane 0 stops as soon as
+        // it emits 31, lane 1 takes the second zero as its fragment length.
+        let src = [
+            0x1c, 0x10, 5, 3, 1, 0x20, 0x3c, 4, 0x0c, 0, 0x28, 5, 0, 0x10, 0, 3, 0x20, 4, 0, 5,
+        ];
+        let tables = Tables::builtin().unwrap();
+        let mut bytes = src.into_iter();
+        let mut got = [0; 4];
+        lanes(&tables, &[4, 4], 1, 2, |_| bytes.next(), &mut got).unwrap();
+        assert_eq!(got, [0, 0, 31, 0]);
+        assert_eq!(bytes.next(), None);
     }
 
     #[test]
@@ -1294,6 +1337,24 @@ mod tests {
         };
         assert_eq!(dst[..8], block(138, 125, &|p| p & 7));
         assert_eq!(dst[8..], block(139, 126, &|p| (p + 1) & 7));
+    }
+
+    #[test]
+    fn unflushed_fragments_can_split_a_refill() {
+        // Both lanes decode 31 at state 0x0100ffff, leaving 0x100.
+        // They need two bytes to reach 0x0100fffe and decode 30. Lane 0
+        // takes the first byte before its fragment boundary and drains for
+        // a clock. Lane 1 takes both bytes after its boundary. The different
+        // boundaries make an early header request change the byte order.
+        let src = [
+            0x0c, 0x0c, 4, 3, 1, 1, 0, 0, 255, 255, 255, 255, 255, 0x1d, 0x1d, 1, 0, 255, 254, 254,
+        ];
+        let mut bytes = src.into_iter();
+        let mut got = [0; 4];
+        let tables = Tables::builtin().unwrap();
+        lanes(&tables, &[4, 4], 1, 2, |_| bytes.next(), &mut got).unwrap();
+        assert_eq!(got, [31, 31, 30, 30]);
+        assert_eq!(bytes.next(), None);
     }
 
     #[test]
@@ -1697,6 +1758,26 @@ mod tests {
             n += 1;
         }
         assert!(n > 0);
+    }
+
+    #[test]
+    fn bc7_first_dictionary_entry_keeps_all_32_indices() {
+        let mut bytes = tables();
+        let bc7 = MODELS * BUCKETS * 2
+            + 256
+            + 64
+            + 256
+            + 64
+            + 64
+            + 512 * 2
+            + DICTIONARY * (6 + 16 + 8 + 32 + 2 + 16 + 4 + 32 + 25 + 33);
+        // Entry 0: bits, then 32 i16 indices (no repeated width bytes).
+        bytes[bc7 + 50..bc7 + 52].copy_from_slice(&[4, 0]);
+        bytes[bc7 + 52..bc7 + 54].copy_from_slice(&2u16.to_le_bytes());
+        bytes[bc7 + 54..bc7 + 56].copy_from_slice(&1u16.to_le_bytes());
+        let t = Tables::parse(&bytes).unwrap();
+        assert_eq!(t.bc7[0].1.ix[0][0], 2);
+        assert_eq!(t.bc7[0].1.ix[0][1], 1);
     }
 
     /// A dictionary entry stands in for a block the decoder made: a set with

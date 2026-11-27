@@ -1015,10 +1015,10 @@ pub fn format(dxgi: u32) -> Option<Format> {
         1..=4 => (16, 1, false),
         9..=18 => (8, 1, false),
         19..=22 | 44..=47 => (4, 1, true),
-        23..=43 | 67 | 87..=93 | 116 | 117 => (4, 1, false),
+        23..=43 | 67 | 87..=93 | 116 | 117 | 189 => (4, 1, false),
         48..=59 | 85 | 86 | 115 => (2, 1, false),
         118..=120 => (2, 1, true),
-        60..=65 => (1, 1, false),
+        60..=65 | 190 => (1, 1, false),
         70..=72 | 79..=81 => (8, 4, false),
         73..=78 | 82..=84 | 94..=99 => (16, 4, false),
         _ => return None,
@@ -1154,6 +1154,27 @@ mod tests {
             })
             .unwrap();
             assert_eq!(tiled.size, single.size * u64::from(samples));
+        }
+    }
+
+    #[test]
+    fn console_formats_use_the_expected_color_layouts() {
+        for swizzle in [Swizzle::LINEAR, Swizzle::SW_64KB_D_X] {
+            // Compare against RGBA8 (28) or R8 (61), which have the same texel size.
+            for (format, reference) in [(189, 28), (190, 61)] {
+                let desc = TextureDesc {
+                    dimension: Dimension::Tex2d,
+                    width: 257,
+                    height: 129,
+                    depth_or_array: 2,
+                    mips: 4,
+                    format,
+                    samples: 1,
+                    swizzle,
+                };
+                let expected = Texture::new(&TextureDesc { format: reference, ..desc }).unwrap();
+                assert_eq!(Texture::new(&desc), Ok(expected), "format {format}, {swizzle:?}");
+            }
         }
     }
 
